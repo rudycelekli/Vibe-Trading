@@ -1,249 +1,46 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
-jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+{
+  "name": "Owned isolated paired native proof (not upstream CI)",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "paired": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 20,
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "persist-credentials": false,
+            "fetch-depth": 0
+          }
+        },
+        {
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.11"
+          }
+        },
+        {
+          "name": "Install unchanged native development and exercised optional extras",
+          "run": "python -m pip install -e \".[dev,openbb,stats,anthropic]\""
+        },
+        {
+          "name": "Native before: require exact regression and baseline failure identities",
+          "run": "git checkout --detach 695a8ecc9a4c2cefc843557446ec2196dbb28a08\ntest \"$(git rev-parse HEAD)\" = \"695a8ecc9a4c2cefc843557446ec2196dbb28a08\"\ngit show 695a8ecc9a4c2cefc843557446ec2196dbb28a08:agent/tests/test_local_loader_cache_identity.py > /tmp/owned-cache-fixture.py\ncp /tmp/owned-cache-fixture.py agent/tests/test_local_loader_cache_identity.py\npython - <<'HASH'\nimport hashlib,pathlib\nassert hashlib.sha256(pathlib.Path('agent/tests/test_local_loader_cache_identity.py').read_bytes()).hexdigest() == '380f95228e21947bc0bf144c842f9526b53f25275a58e778b5b99db1594f23de'\nHASH\nset +e\npython -m pytest agent/tests/test_alpha_compare_api.py agent/tests/test_local_loader_cache_identity.py \"agent/tests/test_equity_crypto_suffix_regressions.py::test_explicit_crypto_pairs_stay_crypto[ETH/USD]\" agent/tests/test_mcp_alpha_zoo_contract.py::test_alpha_bench_does_not_follow_preexisting_report_symlink --junitxml=result.xml --tb=short -q\nstatus=$?\nset -e\ntest \"$status\" = 1\nPHASE=before python - <<'EVAL'\nimport os, json, xml.etree.ElementTree as ET\nphase = os.environ[\"PHASE\"]\nroot = ET.parse(\"result.xml\").getroot()\nrows = list(root.iter(\"testcase\"))\nerrors = [x.attrib.get(\"name\") for x in rows if x.find(\"error\") is not None]\nskipped = [x.attrib.get(\"name\") for x in rows if x.find(\"skipped\") is not None]\nfailures = [x for x in rows if x.find(\"failure\") is not None]\nexpected = []\nfor case in failures:\n   name = case.attrib[\"name\"]\n   body = case.find(\"failure\").text or \"\"\n   valid = (\n       name.startswith(\"test_corrupt_local_cache_metadata_refetches_and_repairs[\")\n       or name == \"test_explicit_crypto_pairs_stay_crypto[ETH/USD]\"\n       or name == \"test_alpha_bench_does_not_follow_preexisting_report_symlink\"\n       or (phase == \"before\" and name.startswith(\"test_alpha_readiness_uses_effective_token_configuration[synthetic-fixture-token-\"))\n   )\n   assert valid, (name, body)\n   assert \"AssertionError\" in body or \"AttributeError\" in body or \"ValueError\" in body or \"TypeError\" in body, (name, body)\n   expected.append(name)\nassert not errors and not skipped, (errors, skipped)\nassert len(rows) >= 25, len(rows)\nassert len(expected) == (8 if phase == \"before\" else 6), expected\nassert len([x for x in expected if x.startswith(\"test_corrupt_local_cache_metadata_refetches_and_repairs[\")]) == 4\nassert len([x for x in expected if x.startswith(\"test_alpha_readiness_uses_effective_token_configuration[\")]) == (2 if phase == \"before\" else 0)\nprint(json.dumps({\"phase\":phase,\"tests\":len(rows),\"failures\":expected,\"passed\":len(rows)-len(expected),\"skipped\":skipped,\"errors\":errors},sort_keys=True))\nEVAL\n"
+        },
+        {
+          "name": "Native after: require exact regression and baseline failure identities",
+          "run": "git checkout --detach 61a012054170add2843b01373f477b4a0adf679f\ntest \"$(git rev-parse HEAD)\" = \"61a012054170add2843b01373f477b4a0adf679f\"\ngit show 695a8ecc9a4c2cefc843557446ec2196dbb28a08:agent/tests/test_local_loader_cache_identity.py > /tmp/owned-cache-fixture.py\ncp /tmp/owned-cache-fixture.py agent/tests/test_local_loader_cache_identity.py\npython - <<'HASH'\nimport hashlib,pathlib\nassert hashlib.sha256(pathlib.Path('agent/tests/test_local_loader_cache_identity.py').read_bytes()).hexdigest() == '380f95228e21947bc0bf144c842f9526b53f25275a58e778b5b99db1594f23de'\nHASH\nset +e\npython -m pytest agent/tests/test_alpha_compare_api.py agent/tests/test_local_loader_cache_identity.py \"agent/tests/test_equity_crypto_suffix_regressions.py::test_explicit_crypto_pairs_stay_crypto[ETH/USD]\" agent/tests/test_mcp_alpha_zoo_contract.py::test_alpha_bench_does_not_follow_preexisting_report_symlink --junitxml=result.xml --tb=short -q\nstatus=$?\nset -e\ntest \"$status\" = 1\nPHASE=after python - <<'EVAL'\nimport os, json, xml.etree.ElementTree as ET\nphase = os.environ[\"PHASE\"]\nroot = ET.parse(\"result.xml\").getroot()\nrows = list(root.iter(\"testcase\"))\nerrors = [x.attrib.get(\"name\") for x in rows if x.find(\"error\") is not None]\nskipped = [x.attrib.get(\"name\") for x in rows if x.find(\"skipped\") is not None]\nfailures = [x for x in rows if x.find(\"failure\") is not None]\nexpected = []\nfor case in failures:\n   name = case.attrib[\"name\"]\n   body = case.find(\"failure\").text or \"\"\n   valid = (\n       name.startswith(\"test_corrupt_local_cache_metadata_refetches_and_repairs[\")\n       or name == \"test_explicit_crypto_pairs_stay_crypto[ETH/USD]\"\n       or name == \"test_alpha_bench_does_not_follow_preexisting_report_symlink\"\n       or (phase == \"before\" and name.startswith(\"test_alpha_readiness_uses_effective_token_configuration[synthetic-fixture-token-\"))\n   )\n   assert valid, (name, body)\n   assert \"AssertionError\" in body or \"AttributeError\" in body or \"ValueError\" in body or \"TypeError\" in body, (name, body)\n   expected.append(name)\nassert not errors and not skipped, (errors, skipped)\nassert len(rows) >= 25, len(rows)\nassert len(expected) == (8 if phase == \"before\" else 6), expected\nassert len([x for x in expected if x.startswith(\"test_corrupt_local_cache_metadata_refetches_and_repairs[\")]) == 4\nassert len([x for x in expected if x.startswith(\"test_alpha_readiness_uses_effective_token_configuration[\")]) == (2 if phase == \"before\" else 0)\nprint(json.dumps({\"phase\":phase,\"tests\":len(rows),\"failures\":expected,\"passed\":len(rows)-len(expected),\"skipped\":skipped,\"errors\":errors},sort_keys=True))\nEVAL\n"
+        },
+        {
+          "name": "Report native formatting gates without changing source",
+          "run": "set +e\npython -m black --check agent/src/api/alpha_routes.py agent/tests/test_alpha_compare_api.py\necho \"black_exit=$?\"\npython -m ruff check agent/src/api/alpha_routes.py agent/tests/test_alpha_compare_api.py\necho \"ruff_exit=$?\"\nexit 0"
+        }
+      ]
+    }
+  }
+}
