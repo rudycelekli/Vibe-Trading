@@ -16,6 +16,7 @@ convention in ``test_goal_api.py`` / ``test_security_auth_api.py``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,6 +24,8 @@ from fastapi.testclient import TestClient
 
 import api_server
 from src.api import alpha_routes
+from src.config import accessor
+from src.config.env_schema import DataConfig, EnvConfig
 
 
 def _client() -> TestClient:
@@ -193,3 +196,42 @@ def test_stream_unknown_job_is_404() -> None:
 def test_stream_invalid_job_id_is_400() -> None:
     r = _client().get("/alpha/compare/bad@id/stream")
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("token", "installed", "ready", "reason"),
+    [
+        ("synthetic-fixture-token", True, True, "tushare_ready"),
+        ("synthetic-fixture-token", False, False, "tushare_dependency_missing"),
+        ("", True, False, "tushare_token_missing"),
+        ("", False, False, "tushare_token_missing"),
+    ],
+)
+def test_alpha_readiness_uses_effective_token_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    token: str,
+    installed: bool,
+    ready: bool,
+    reason: str,
+) -> None:
+    """Readiness must use the same typed settings as the market-data loader."""
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    monkeypatch.setattr(
+        accessor, "_instance", EnvConfig(data=DataConfig(TUSHARE_TOKEN=token))
+    )
+    # Replace only this module's dependency-probe reference, not shared importlib.
+    monkeypatch.setattr(
+        alpha_routes,
+        "importlib",
+        SimpleNamespace(
+            util=SimpleNamespace(find_spec=lambda name: object() if installed else None)
+        ),
+    )
+    response = _client().get("/alpha/readiness")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["universes"]["csi300"] == {"ready": ready, "reason": reason}
+    assert payload["universes"]["sp500"] == {"ready": True, "reason": "public_data"}
+    assert payload["universes"]["btc-usdt"] == {"ready": False, "reason": "single_asset"}
+    assert payload["zoo_counts"]
+    assert "synthetic-fixture-token" not in response.text
