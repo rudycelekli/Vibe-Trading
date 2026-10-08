@@ -221,6 +221,8 @@ def _channel_entry(name: str, section: dict[str, Any], status_map: dict[str, Any
         "loaded": bool(status_map.get("loaded", False)),
         "install_hint": str(status_map.get("install_hint") or ""),
         "error": str(status_map.get("error") or ""),
+        "error_context": str(status_map.get("error_context") or ""),
+        "error_at": str(status_map.get("error_at") or ""),
         "supports_test": _supports_connection_test(name),
         "sdk_available": bool(status_map.get("sdk_available", available)),
         "fields": channel_field_hints(name),

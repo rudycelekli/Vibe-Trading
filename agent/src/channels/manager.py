@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from collections import defaultdict
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from src.channels.base import BaseChannel
 from src.channels.bus.events import OutboundMessage
@@ -37,6 +40,30 @@ _RELOAD_STOP_TIMEOUT_S = 10.0
 
 # Inbound messages whose reply fingerprint is kept for duplicate suppression.
 _MAX_REPLY_FINGERPRINTS = 4096
+
+# Runtime-error bookkeeping for the status surface (Refs #1625).
+_ERROR_CONTEXTS = frozenset({"start", "send", "reload_stop"})
+_ERROR_TEXT_LIMIT = 200
+_URL_IN_TEXT_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://\S+")
+
+
+def _strip_url_userinfo(text: str) -> str:
+    """Return *text* with username/password stripped from every embedded URL."""
+
+    def _strip(match: re.Match[str]) -> str:
+        url = match.group(0)
+        try:
+            parts = urlsplit(url)
+            if parts.username is None and parts.password is None:
+                return url
+            host = parts.hostname or ""
+            if parts.port is not None:  # raises ValueError on a malformed port
+                host = f"{host}:{parts.port}"
+            return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+        except ValueError:
+            return url
+
+    return _URL_IN_TEXT_RE.sub(_strip, text)
 
 
 class ChannelManager:
@@ -140,6 +167,8 @@ class ChannelManager:
                 running=channel.is_running,
                 display_name=getattr(cls, "display_name", name),
                 error="",
+                error_context="",
+                error_at="",
             )
             logger.info("%s channel enabled", cls.display_name)
             return channel
@@ -224,8 +253,9 @@ class ChannelManager:
         """Start a channel and log any exceptions."""
         try:
             await channel.start()
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to start channel %s", name)
+            self._record_error(name, "start", exc)
 
     def _spawn_channel_start(self, name: str, channel: BaseChannel) -> None:
         """Start a channel in the background, keeping a strong task reference."""
@@ -301,17 +331,22 @@ class ChannelManager:
 
     async def _reload_channel_locked(self, name: str, section: dict | None) -> dict[str, Any]:
         old = self.channels.get(name)
+        stop_error: BaseException | None = None
         if old is not None:
             try:
                 await asyncio.wait_for(old.stop(), timeout=_RELOAD_STOP_TIMEOUT_S)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
                 logger.warning("Stopping %s timed out; replacing", name)
-            except Exception:
+                stop_error = exc
+            except Exception as exc:
                 logger.warning("Stopping %s failed; replacing", name, exc_info=True)
+                stop_error = exc
         self.channels.pop(name, None)
         self._store_channel_section(name, section)
 
         if section is None or not self._section_enabled(section):
+            if stop_error is not None:
+                self._record_error(name, "reload_stop", stop_error)
             return self._record_status(
                 name,
                 configured=section is not None,
@@ -323,6 +358,10 @@ class ChannelManager:
         channel = self._build_channel(name, section)
         if channel is None:
             return self._record_status(name)
+        if stop_error is not None:
+            # After the build's success-clear: a wedged stop means the old adapter
+            # may still be alive; the status must explain the degraded swap.
+            self._record_error(name, "reload_stop", stop_error)
         self.channels[name] = channel
         if self._is_manager_running():
             # start() can be long-running (reconnect loops), so it must not be
@@ -338,6 +377,19 @@ class ChannelManager:
         self._status.setdefault(name, {})
         self._status[name].update(fields)
         return self._status[name]
+
+    def _record_error(self, name: str, context: str, exc: BaseException) -> None:
+        """Merge a scrubbed one-line runtime-error summary into ``_status[name]``.
+
+        ``context`` is one of ``_ERROR_CONTEXTS``; the traceback stays in the log
+        because the status surface flows into HTTP responses (Refs #1625).
+        """
+        self._record_status(
+            name,
+            error=_strip_url_userinfo(f"{type(exc).__name__}: {exc}")[:_ERROR_TEXT_LIMIT],
+            error_context=context,
+            error_at=datetime.now(timezone.utc).isoformat(),
+        )
 
     @staticmethod
     def _section_enabled(section: Any) -> bool:
@@ -549,6 +601,7 @@ class ChannelManager:
                         "Failed to send to %s after %d attempts",
                         msg.channel, max_attempts,
                     )
+                    self._record_error(msg.channel, "send", e)
                     return
                 delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
                 logger.warning(
