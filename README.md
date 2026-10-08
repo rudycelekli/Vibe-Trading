@@ -1258,6 +1258,11 @@ vibe-trading alpha show gtja191_171
 vibe-trading alpha bench --zoo gtja191 --universe csi300 --period 2018-2025 --top 20
 ```
 
+The Web UI's `GET /alpha/readiness` checks CSI300 using the same effective token
+settings as the market-data loader and the installed Tushare dependency. It
+distinguishes a missing token from a missing dependency; it does not contact
+Tushare or validate credentials or data availability.
+
 </details>
 
 <details>
