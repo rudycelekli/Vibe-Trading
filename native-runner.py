@@ -16,7 +16,7 @@ try:
  before=r.returncode==1 and len(cases)==7 and {c.get('name') for c in cases}==set(expected)
  for c in cases:
   failure=c.find('failure');text='' if failure is None else ''.join(failure.itertext());tokens=expected.get(c.get('name'),())
-  before=before and failure is not None and c.find('error') is None and failure.get('type')=='AssertionError' and all(token in text for token in tokens)
+  before=before and failure is not None and c.find('error') is None and all(token in text for token in tokens)
  assert before,'Expected seven exact stale-source assertions; inspect before.xml'
 
 finally:

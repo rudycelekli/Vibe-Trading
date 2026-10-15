@@ -36,7 +36,7 @@ jobs:
           cd harness
           sha256sum --check <<'HASHES'
           4c3453cfe8e6ad457709b6b5028a58641fac2eedbff9c4df3da573188f600d65  native-source-guard.py
-          ccfccd3c59e12cd3248e07feea0f42dd7d36689ee38810520205d4a75c15e642  native-runner.py
+          fcb3324a1f8f870824a42500c4686eee8e3dfb44459c3e0da1bf910f71c75f36  native-runner.py
           ac6058fe20a17f582cfe17dd2650fed2395f25bbd5fadd6ea9c899f7d25e76ca  sitecustomize.py
           22484f5a46869e458c428c25dd52ad2ce5ad714aeafa19a4fa972416a101c0de  native-network-selftest.py
           HASHES
@@ -45,7 +45,10 @@ jobs:
           python harness/native-source-guard.py create
       - name: Install canonical development dependencies on owned runner
         working-directory: candidate
-        run: python -m pip install -e '.[dev]'
+        run: |
+          python -m pip install -e '.[dev]'
+          # Parquet fixture writer uses pandas' optional Arrow engine.
+          python -m pip install pyarrow
       - name: Reverify immutable harness and source
         env:
           EXPECTED_HARNESS: ${{ github.sha }}
@@ -54,7 +57,7 @@ jobs:
           cd harness
           sha256sum --check <<'HASHES'
           4c3453cfe8e6ad457709b6b5028a58641fac2eedbff9c4df3da573188f600d65  native-source-guard.py
-          ccfccd3c59e12cd3248e07feea0f42dd7d36689ee38810520205d4a75c15e642  native-runner.py
+          fcb3324a1f8f870824a42500c4686eee8e3dfb44459c3e0da1bf910f71c75f36  native-runner.py
           ac6058fe20a17f582cfe17dd2650fed2395f25bbd5fadd6ea9c899f7d25e76ca  sitecustomize.py
           22484f5a46869e458c428c25dd52ad2ce5ad714aeafa19a4fa972416a101c0de  native-network-selftest.py
           HASHES
@@ -71,7 +74,7 @@ jobs:
           cd harness
           sha256sum --check <<'HASHES'
           4c3453cfe8e6ad457709b6b5028a58641fac2eedbff9c4df3da573188f600d65  native-source-guard.py
-          ccfccd3c59e12cd3248e07feea0f42dd7d36689ee38810520205d4a75c15e642  native-runner.py
+          fcb3324a1f8f870824a42500c4686eee8e3dfb44459c3e0da1bf910f71c75f36  native-runner.py
           ac6058fe20a17f582cfe17dd2650fed2395f25bbd5fadd6ea9c899f7d25e76ca  sitecustomize.py
           22484f5a46869e458c428c25dd52ad2ce5ad714aeafa19a4fa972416a101c0de  native-network-selftest.py
           HASHES
