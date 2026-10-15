@@ -1,0 +1,85 @@
+name: Bounded local cache revision native qualification
+on:
+  push:
+    branches: [validation/local-cache-bounded-revision]
+permissions:
+  contents: read
+jobs:
+  native:
+    if: github.repository == 'rudycelekli/Vibe-Trading'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: db28ae5a69c091f370c2b46e3ae8446f3a11dce8
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Freeze immutable tracked source before dependencies
+        env:
+          EXPECTED_HARNESS: ${{ github.sha }}
+        run: |
+          test "$(git -C harness rev-parse HEAD)" = "$EXPECTED_HARNESS"
+          cd harness
+          sha256sum --check <<'HASHES'
+          4c3453cfe8e6ad457709b6b5028a58641fac2eedbff9c4df3da573188f600d65  native-source-guard.py
+          ccfccd3c59e12cd3248e07feea0f42dd7d36689ee38810520205d4a75c15e642  native-runner.py
+          ac6058fe20a17f582cfe17dd2650fed2395f25bbd5fadd6ea9c899f7d25e76ca  sitecustomize.py
+          22484f5a46869e458c428c25dd52ad2ce5ad714aeafa19a4fa972416a101c0de  native-network-selftest.py
+          HASHES
+          cd ..
+          python harness/native-network-selftest.py
+          python harness/native-source-guard.py create
+      - name: Install canonical development dependencies on owned runner
+        working-directory: candidate
+        run: python -m pip install -e '.[dev]'
+      - name: Reverify immutable harness and source
+        env:
+          EXPECTED_HARNESS: ${{ github.sha }}
+        run: |
+          test "$(git -C harness rev-parse HEAD)" = "$EXPECTED_HARNESS"
+          cd harness
+          sha256sum --check <<'HASHES'
+          4c3453cfe8e6ad457709b6b5028a58641fac2eedbff9c4df3da573188f600d65  native-source-guard.py
+          ccfccd3c59e12cd3248e07feea0f42dd7d36689ee38810520205d4a75c15e642  native-runner.py
+          ac6058fe20a17f582cfe17dd2650fed2395f25bbd5fadd6ea9c899f7d25e76ca  sitecustomize.py
+          22484f5a46869e458c428c25dd52ad2ce5ad714aeafa19a4fa972416a101c0de  native-network-selftest.py
+          HASHES
+          cd ..
+          python harness/native-source-guard.py verify
+      - name: Execute isolated causal and caller qualification
+        run: python harness/native-runner.py
+      - name: Final immutable harness and source
+        if: always()
+        env:
+          EXPECTED_HARNESS: ${{ github.sha }}
+        run: |
+          test "$(git -C harness rev-parse HEAD)" = "$EXPECTED_HARNESS"
+          cd harness
+          sha256sum --check <<'HASHES'
+          4c3453cfe8e6ad457709b6b5028a58641fac2eedbff9c4df3da573188f600d65  native-source-guard.py
+          ccfccd3c59e12cd3248e07feea0f42dd7d36689ee38810520205d4a75c15e642  native-runner.py
+          ac6058fe20a17f582cfe17dd2650fed2395f25bbd5fadd6ea9c899f7d25e76ca  sitecustomize.py
+          22484f5a46869e458c428c25dd52ad2ce5ad714aeafa19a4fa972416a101c0de  native-network-selftest.py
+          HASHES
+          cd ..
+          python harness/native-source-guard.py verify
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: bounded-cache-proof-${{ matrix.python }}
+          path: proof
+          retention-days: 1
