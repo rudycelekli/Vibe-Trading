@@ -347,6 +347,10 @@ class GroundingLedger(
             self._ingest_engine_table(payload, call_id)
         elif tool_name == "read_run_artifact" and payload is not None:
             self._ingest_engine_table(payload, call_id, tool_name=tool_name)
+        elif tool_name == "read_document" and payload is not None:
+            # The body is one string, so generic leaf intake never sees its figures (#2050).
+            self._ingest_document_text(payload, call_id)
+            self._ingest_generic_numeric(tool_name, arguments, payload, call_id)
         elif payload is not None:
             self._ingest_generic_numeric(tool_name, arguments, payload, call_id)
         self.persist()

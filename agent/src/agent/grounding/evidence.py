@@ -15,7 +15,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.agent.grounding.figures import _CURRENCY_CODES
+from src.agent.grounding.figures import (
+    _CURRENCY_CODES,
+    parse_figures_block,
+    scan_figures,
+)
 from src.agent.grounding.identity import (
     _CANONICAL_SYMBOL_RE,
     _infer_currency,
@@ -1210,6 +1214,46 @@ class _EvidenceMixin:
                         venue=_infer_venue(symbol),
                     )
                 )
+
+    def _ingest_document_text(self, payload: dict[str, Any], call_id: str) -> None:
+        """Record measured numbers written inside a ``read_document`` text body.
+
+        The reader returns the document as one JSON string. Generic leaf intake
+        skips that string, so a quarterly report's figures never became evidence
+        and the gate redacted every number the model quoted from it (#2050).
+        The reader does not split the body by page, so provenance is the file.
+        """
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return
+        filename = payload.get("file")
+        if not isinstance(filename, str) or not filename.strip():
+            filename = "document"
+        source = f"document:{filename.strip()}"
+        seen: set[tuple[str, float]] = set()
+        room = _MAX_GENERIC_EVIDENCE
+        for figure in scan_figures(text, parse_figures_block("")):
+            if figure.shape != "measured" or room <= 0:
+                continue
+            field = "document.text.percent" if figure.percent else "document.text"
+            key = (field, figure.value)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._evidence.append(
+                EvidenceRecord(
+                    call_id=call_id,
+                    tool="read_document",
+                    symbol=None,
+                    source=source,
+                    timestamp=None,
+                    field=field,
+                    value=figure.value,
+                    status="observed",
+                    currency=None if figure.percent else figure.currency_code,
+                )
+            )
+            room -= 1
 
     def _ingest_generic_numeric(
         self,

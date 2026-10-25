@@ -1625,6 +1625,35 @@ class _PolicyMixin:
             band = min(band, _written_half_unit(written) * unit * (1 + 1e-9))
         return abs(candidate - target) <= max(band, 1e-9)
 
+    def _document_text_values(self, figure: Figure, *, ref: str | None = None) -> list[float]:
+        """Measured numbers a ``read_document`` body contributed (#2050).
+
+        A percent is answered only by percent-shaped text, and a call-scoped
+        declaration only by that call. An unmarked filing amount may still
+        answer a currency-marked quote of the same digits.
+        """
+        wanted = "document.text.percent" if figure.percent else "document.text"
+        key = (ref or "").strip()
+        values: list[float] = []
+        for record in self._evidence:
+            if (
+                record.tool != "read_document"
+                or record.field != wanted
+                or record.status != "observed"
+                or record.value is None
+            ):
+                continue
+            if key and key not in (record.call_id, record.tool, record.source):
+                continue
+            if (
+                not figure.percent
+                and figure.currency_code is not None
+                and record.currency not in (None, figure.currency_code)
+            ):
+                continue
+            values.append(float(record.value))
+        return values
+
     @grounding_check(name="figure-observed", code="numeric_claim_conflict",
                      additional_codes=("numeric_claim_unavailable",),
                      description="Validate the observed figure contract against evidence.")
@@ -1690,6 +1719,10 @@ class _PolicyMixin:
                     if record.currency == figure.currency_code
                 ]
             values = [float(record.value) for record in scoped_records] + metric_values
+            if figure.column is None:
+                # A currency mark drops non-price rows. Document text is not a
+                # quote, but it is the observation a filing figure cites (#2050).
+                values.extend(self._document_text_values(figure, ref=declaration.ref))
             money = figure.currency and not figure.percent
             # A call- or tool-scoped ref pools every field that call returned,
             # so it cannot choose between the tail-risk identities in it (#1425).
@@ -1792,6 +1825,8 @@ class _PolicyMixin:
             ), []
         else:
             direct, scaled = prices + self._row_pool(symbol), self._metric_pool(symbol)
+        if figure.column is None:
+            direct = [*direct, *self._document_text_values(figure)]
         # An undeclared tail-risk figure is matched against every tail-risk
         # value in the session, so it needs a field ref for the same reason a
         # call-scoped one does (#1425).
@@ -1977,8 +2012,16 @@ class _PolicyMixin:
             anchors.extend(
                 float(record.value)
                 for record in scoped[0]
-                if (not money or _is_price_kind(record))
-                and (currency_code is None or record.currency == currency_code)
+                if (
+                    not money
+                    or _is_price_kind(record)
+                    or record.field == "document.text"
+                )
+                and (
+                    currency_code is None
+                    or record.currency == currency_code
+                    or (record.field == "document.text" and record.currency is None)
+                )
                 and not (unattributed and record.symbol)
             )
             if not money and not unattributed:
