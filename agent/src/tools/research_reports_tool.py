@@ -25,6 +25,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from backtest.loaders._http import (
     DEFAULT_USER_AGENT,
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 # Eastmoney research-report list endpoint. qType=0 selects individual-stock
 # reports; the response carries a ``data`` array of one row per report.
 _REPORT_LIST_URL = "https://reportapi.eastmoney.com/report/list"
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 # THS consensus-forecast endpoint. Returns per-forward-year mean analyst EPS.
 _THS_CONSENSUS_URL = "https://basic.10jqka.com.cn/api/stock/profit_forecast/"
@@ -137,7 +139,8 @@ class ResearchReportsTool(BaseTool):
             return _error(f"could not resolve A-share symbol '{code}'")
 
         limit = _clamp_limit(kwargs.get("limit", _DEFAULT_LIMIT))
-        now = datetime.now()
+        # Eastmoney dates reports on the Beijing calendar, not the host's.
+        now = datetime.now(_SHANGHAI).replace(tzinfo=None)
         default_end = now
         default_begin = now - timedelta(days=730)
         begin_time = _parse_date_param(kwargs.get("beginTime"), default_begin)
