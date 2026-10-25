@@ -2,19 +2,19 @@
 # (Apache-2.0). Copyright (c) Microsoft Corporation.
 # ============================================================
 # 中文名称: 最高价位置 5日
-# 简要说明: ts_argmax(high, 5) / 5，5日内最高价出现位置的归一化指标。
-# 典型用途: 值接近0表示最高价出现在近期，接近1表示出现在较早期。
+# 简要说明: IdxMax(high, 5)/5。最早一根为 1/5，最近一根为 1。
+# 典型用途: 值接近 1 表示最高价出现在最近一根。
 # ============================================================
-"""qlib158 IMAX5: formula = \\mathrm{ts\\_argmax}(\\mathrm{high}, 5) / 5."""
+"""qlib158 IMAX5: formula = \\mathrm{IdxMax}(\\mathrm{high}, 5) / 5."""
 from __future__ import annotations
 
 import pandas as pd
-from src.factors.base import ts_argmax
+from src.factors.base import ts_idxmax
 
 __alpha_meta__ = {
     'id': 'qlib158_imax5',
     'theme': ['momentum'],
-    'formula_latex': '\\\\mathrm{ts\\\\_argmax}(\\\\mathrm{high}, 5) / 5',
+    'formula_latex': '\\\\mathrm{IdxMax}(\\\\mathrm{high}, 5) / 5',
     'columns_required': ['high'],
     'universe': ['equity_us', 'equity_cn', 'equity_hk', 'equity_in', 'equity_kr'],
     'frequency': ['1d'],
@@ -26,4 +26,4 @@ __alpha_meta__ = {
 def compute(panel: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Return qlib158 IMAX5 on the supplied OHLCV panel."""
     h = panel['high']
-    return ts_argmax(h, 5) / float(5)
+    return ts_idxmax(h, 5) / float(5)

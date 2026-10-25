@@ -340,6 +340,41 @@ def ts_argmin(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.rolling(window=n, min_periods=n).apply(_argmin_last, raw=True)
 
 
+def _qlib_first_index(df: pd.DataFrame, n: int, *, minimum: bool) -> pd.DataFrame:
+    """1-based index of the first extreme in each full window.
+
+    Qlib's ``IdxMax`` / ``IdxMin`` are ``argmax() + 1`` and ``argmin() + 1``
+    on a window ordered oldest to newest, so the oldest bar is 1, the current
+    bar is ``n``, and a tie keeps the earlier bar. :func:`ts_argmax` is the
+    other convention: 0-based, and a tie keeps the newer bar.
+    """
+    if n < 1:
+        raise ValueError(f"index window must be >= 1, got {n}")
+    arr = df.to_numpy(dtype=np.float64)
+    rows, cols = arr.shape
+    result = np.full((rows, cols), np.nan)
+    if rows < n:
+        return pd.DataFrame(result, index=df.index, columns=df.columns)
+    windows = sliding_window_view(arr, window_shape=n, axis=0)
+    invalid = np.isnan(windows).any(axis=2)
+    filled = np.where(np.isnan(windows), np.inf if minimum else -np.inf, windows)
+    position = np.argmin(filled, axis=2) if minimum else np.argmax(filled, axis=2)
+    values = (position + 1).astype(np.float64)
+    values[invalid] = np.nan
+    result[n - 1 :] = values
+    return pd.DataFrame(result, index=df.index, columns=df.columns)
+
+
+def ts_idxmax(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Qlib ``IdxMax``: 1-based index of the first maximum, warmup → NaN."""
+    return _qlib_first_index(df, n, minimum=False)
+
+
+def ts_idxmin(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Qlib ``IdxMin``: 1-based index of the first minimum, warmup → NaN."""
+    return _qlib_first_index(df, n, minimum=True)
+
+
 def delta(df: pd.DataFrame, d: int) -> pd.DataFrame:
     """First difference at lag ``d``: ``df - df.shift(d)``.
 
