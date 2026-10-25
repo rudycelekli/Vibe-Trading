@@ -2186,8 +2186,8 @@ def test_generated_engine_other_market_rule_is_not_a_wildcard() -> None:
 
 @pytest.mark.unit
 def test_conditional_entry_emits_signal_when_rsi_in_range() -> None:
-    """RSI in [25, 45] → signal fires."""
-    rule = _rule_with_rsi(25.0, 45.0)
+    """RSI in [25, 48] → signal fires (this sawtooth's Wilder RSI bottoms near 45.5)."""
+    rule = _rule_with_rsi(25.0, 48.0)
     idx = _hourly_index(periods=40)
     sideways = pd.Series(
         [10.0 + (i % 6) * 0.5 for i in range(40)], index=idx, dtype=float,

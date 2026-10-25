@@ -39,15 +39,25 @@ class SignalEngine:
     rule's holding days. Non-matching codes yield a zero series.
     """
 
+    def _wilder_average(self, values: pd.Series, period: int) -> pd.Series:
+        """Seed with a simple mean, then recurse over observed values."""
+        result = pd.Series(float("nan"), index=values.index, dtype=float)
+        positions = [i for i, seen in enumerate(values.notna()) if seen]
+        if len(positions) < period:
+            return result
+        observed = values.iloc[positions].reset_index(drop=True)
+        seed = observed.iloc[:period].mean()
+        tail = pd.concat([pd.Series([seed]), observed.iloc[period:]], ignore_index=True)
+        result.iloc[positions[period - 1:]] = tail.ewm(alpha=1 / period, adjust=False).mean().to_numpy()
+        return result
+
     def _compute_rsi(self, close: pd.Series, period: int = 14) -> pd.Series:
-        """Causal Wilder-EWM RSI (mirrors ``compute_rsi`` in example_signal_engine.py:13)."""
+        """SMA-seeded Wilder RSI, the one the rule's RSI band was mined with
+        (``src.shadow_account.indicators.compute_rsi``)."""
         delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-        avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
-        avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
-        rs = avg_gain / avg_loss
-        return 100 - 100 / (1 + rs)
+        avg_gain = self._wilder_average(delta.clip(lower=0), period)
+        avg_loss = self._wilder_average((-delta).clip(lower=0), period)
+        return 100 - 100 / (1 + avg_gain / avg_loss)
 
     def _compute_prior_return(self, close: pd.Series, window: int = 5) -> pd.Series:
         """Trailing close-to-close return over *window* bars."""
