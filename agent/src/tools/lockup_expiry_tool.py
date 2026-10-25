@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from backtest.loaders import eastmoney_client
 from src.agent.tools import BaseTool
@@ -44,9 +45,13 @@ _MAX_RECORDS = 200
 _PAGE_SIZE = 200
 
 
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
 def _today() -> date:
-    """Return today's date (indirection kept for test monkeypatching)."""
-    return datetime.now(timezone.utc).date()
+    """Return today's Beijing date, the calendar FREE_DATE is published in
+    (indirection kept for test monkeypatching)."""
+    return datetime.now(_SHANGHAI).date()
 
 
 def _compact(d: date) -> str:
