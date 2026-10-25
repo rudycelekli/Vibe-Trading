@@ -2,10 +2,10 @@
 # (Apache-2.0). Copyright (c) Microsoft Corporation.
 # ============================================================
 # 中文名称: 收益率-量变化相关性 10日
-# 简要说明: ts_corr(close/close_prev, log(v/v_prev), 10)，10日收益率与成交量变化率的相关系数。
+# 简要说明: ts_corr(close/close_prev, log(v/v_prev+1), 10)，10日收益率与 log(成交量比+1) 的相关系数。
 # 典型用途: 衡量10日价格变动与成交量变动的相关性，反映量价配合程度。
 # ============================================================
-"""qlib158 CORD10: formula = \\mathrm{ts\\_corr}(\\mathrm{close}/\\mathrm{close}_{{-1}}, \\log((\\mathrm{volume}+1)/(\\mathrm{volume}_{{-1}}+1)), 10)."""
+"""qlib158 CORD10: formula = \\mathrm{ts\\_corr}(\\mathrm{close}/\\mathrm{close}_{{-1}}, \\log(\\mathrm{volume}/\\mathrm{volume}_{{-1}}+1), 10)."""
 from __future__ import annotations
 
 import numpy as np
@@ -15,7 +15,7 @@ from src.factors.base import safe_div, ts_corr
 __alpha_meta__ = {
     'id': 'qlib158_cord10',
     'theme': ['volume', 'microstructure'],
-    'formula_latex': '\\\\mathrm{ts\\\\_corr}(\\\\mathrm{close}/\\\\mathrm{close}_{{-1}}, \\\\log((\\\\mathrm{volume}+1)/(\\\\mathrm{volume}_{{-1}}+1)), 10)',
+    'formula_latex': '\\\\mathrm{ts\\\\_corr}(\\\\mathrm{close}/\\\\mathrm{close}_{{-1}}, \\\\log(\\\\mathrm{volume}/\\\\mathrm{volume}_{{-1}}+1), 10)',
     'columns_required': ['close', 'volume'],
     'universe': ['equity_us', 'equity_cn', 'equity_hk', 'equity_in', 'equity_kr'],
     'frequency': ['1d'],
@@ -29,6 +29,6 @@ def compute(panel: dict[str, pd.DataFrame]) -> pd.DataFrame:
     c = panel['close']
     v = panel['volume']
     c_ret = safe_div(c, c.shift(1))
-    v_ret = safe_div(v + 1.0, v.shift(1) + 1.0)
-    logvr = np.log(v_ret)
+    # qlib: Log(volume/Ref(volume, 1)+1). log((volume+1)/(prev+1)) is a different series.
+    logvr = np.log(safe_div(v, v.shift(1)) + 1.0)
     return ts_corr(c_ret, logvr, 10)
