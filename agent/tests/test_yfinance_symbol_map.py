@@ -22,3 +22,11 @@ def test_plain_tickers_unchanged() -> None:
 def test_crypto_and_suffix_forms_untouched() -> None:
     assert _to_yfinance_symbol("BTC-USDT") == "BTC-USD"
     assert _to_yfinance_symbol("TD.TO") == "TD.TO"
+
+
+def test_hkex_five_digit_codes_use_yahoo_four_digit_ticker() -> None:
+    # HKEX prints 00700. Yahoo's chart 404s that form and serves 0700.HK.
+    # A genuine five-digit counter (80700, the RMB line) has nothing to drop.
+    assert _to_yfinance_symbol("00700.HK") == "0700.HK"
+    assert _to_yfinance_symbol("00005.HK") == "0005.HK"
+    assert _to_yfinance_symbol("80700.HK") == "80700.HK"

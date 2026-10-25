@@ -66,9 +66,11 @@ def _to_yfinance_symbol(code: str) -> str:
         # form returns empty data (live-verified), so map BRK.B.US -> BRK-B.
         return upper[:-3].replace(".", "-")
     if upper.endswith(".HK"):
-        digits = upper[:-3]
-        width = max(4, len(digits))
-        return f"{digits.zfill(width)}.HK"
+        # HKEX prints five digits (00700). Yahoo's chart 404s that form and
+        # serves the four-digit ticker (0700.HK). Drop only redundant leading
+        # zeroes; a genuine five-digit counter (80700.HK, the RMB line) stays.
+        digits = upper[:-3].lstrip("0") or "0"
+        return f"{digits.zfill(4)}.HK"
     # Crypto: BTC-USDT -> BTC-USD, ETH-USDT -> ETH-USD, etc.
     if upper.endswith("-USDT"):
         return upper[:-5] + "-USD"
