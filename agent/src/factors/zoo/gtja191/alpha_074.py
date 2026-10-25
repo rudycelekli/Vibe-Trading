@@ -50,8 +50,10 @@ def compute(panel: dict) -> pd.DataFrame:
     l = panel["low"]
     v = panel["volume"]
     vw = vwap(panel, "equity_cn")
-    sumA = (l * 0.35 + vw * 0.65).rolling(10, min_periods=10).sum()
-    sumB = ts_mean(v, 10).rolling(10, min_periods=10).sum()
+    # The 40-day volume mean stays shortened to 10. Both SUM windows are the
+    # report's 20; a 10-day sum was the mean's truncation leaking into them.
+    sumA = (l * 0.35 + vw * 0.65).rolling(20, min_periods=20).sum()
+    sumB = ts_mean(v, 10).rolling(20, min_periods=20).sum()
     t1 = rank(ts_corr(sumA, sumB, 7))
     t2 = rank(ts_corr(rank(vw), rank(v), 6))
     return t1 + t2
