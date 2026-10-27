@@ -1,249 +1,115 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
+name: DeepTutor exact-dev precommit baseline diagnostic proposal
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: deeptutor-baseline-precommit
+  cancel-in-progress: false
 jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
+  baseline-precommit:
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: HKUDS/DeepTutor
+        ref: 555b306d6e9e265159d3066ed1b134fad2298914
+        persist-credentials: false
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: 3.11.17
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: 22.23.3
+    - name: Verify exact base and replicate captured Stage1 main environment
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/evidence"
+        test "$(git rev-parse HEAD)" = '555b306d6e9e265159d3066ed1b134fad2298914'
+        test "$(git write-tree)" = "$(git rev-parse 'HEAD^{tree}')"
+        git diff --exit-code HEAD --
+        git ls-files -s > "$RUNNER_TEMP/evidence/source-index-before.txt"
+        git rev-parse HEAD > "$RUNNER_TEMP/evidence/source-head-before.txt"
+        git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/evidence/source-tree-before.txt"
+        printf '%s' 'YWlvaGFwcHlleWViYWxscz09Mi43LjEKYWlvaHR0cD09My4xNC41CmFpb3NpZ25hbD09MS40LjAKYWlvc3FsaXRlPT0wLjIyLjEKYW5ub3RhdGVkLWRvYz09MC4wLjUKYW5ub3RhdGVkLXR5cGVzPT0wLjguMAphbnRocm9waWM9PTIuMy4wCmFueWlvPT00LjE1LjEKQVBTY2hlZHVsZXI9PTMuMTEuMwphcnhpdj09NC4wLjIKYXR0cnM9PTI2LjEuMApiYW5rcz09Mi41LjEKYmNyeXB0PT01LjAuMApiaWRpY3Q9PTAuMjQuMQpibTI1cz09MC4zLjE1CmJvdG8zPT0xLjQzLjEyMApib3RvY29yZT09MS40My4xMjAKY2FjaGV0b29scz09Ny4yLjYKY2VydGlmaT09MjAyNi4xMC4yMwpjZmZpPT0yLjEuMQpjZmd2PT0zLjUuMApjaGFyc2V0LW5vcm1hbGl6ZXI9PTMuNS4yCmNsaWNrPT04LjUuMApjbG91ZHBpY2tsZT09My4xLjIKY29sb3JhbWE9PTAuNC42CmNyb25pdGVyPT02LjIuNApjcnlwdG9ncmFwaHk9PTUwLjAuMgpkYXNoc2NvcGU9PTIuMC4yCmRhdGFjbGFzc2VzLWpzb249PTAuNi43CmRkZ3M9PTkuMTYuMQpkZWZ1c2VkeG1sPT0wLjcuMQpEZXByZWNhdGVkPT0xLjMuMQpkaW5ndGFsay1zdHJlYW09PTAuMjQuMwpkaXJ0eWpzb249PTEuMC44CmRpc3RsaWI9PTAuNC40CmRpc3Rybz09MS45LjAKZG9jc3RyaW5nX3BhcnNlcj09MC4xOC4wCmVjZHNhPT0wLjE5LjIKZXRfeG1sZmlsZT09Mi4wLjAKZmFpc3MtY3B1PT0xLjE1LjEKZmFzdGFwaT09MC4xNjIuMApmYXN0YXBpX2d1YXJkPT04LjEuMgpmYXN0dXVpZD09MC4xNC4wCmZpbGVsb2NrPT0zLjMyLjcKZmlsZXR5cGU9PTEuMi4wCmZsYXRidWZmZXJzPT0yNS4xMi4xOQpmcm96ZW5saXN0PT0xLjguMApmc3NwZWM9PTIwMjYuOS4wCmdyZWVubGV0PT0zLjUuNgpncmlmZmU9PTIuNC4xCmdyaWZmZWNsaT09Mi40LjEKZ3JpZmZlbGliPT0yLjQuMQpncmltcD09My4xOApndWFyZC1jb3JlPT00LjQuMApoMTE9PTAuMTYuMApoMj09NC40LjEKaGYteGV0PT0xLjcuMApocGFjaz09NC4yLjAKaHR0cGNvcmU9PTEuMC45Cmh0dHBjb3JlMj09Mi4xNi4wCmh0dHB0b29scz09MC45LjAKaHR0cHg9PTAuMjguMQpodHRweC1zc2U9PTAuNC4zCmh0dHB4Mj09Mi4xNi4wCmh1Z2dpbmdmYWNlX2h1Yj09MS4zMy4wCmh5cGVyZnJhbWU9PTYuMS4wCmlkZW50aWZ5PT0yLjYuMjAKaWRuYT09My4yMAppbXBvcnQtbGludGVyPT0yLjExCmltcG9ydGxpYl9tZXRhZGF0YT09OC45LjAKaW5pY29uZmlnPT0yLjMuMQpKaW5qYTI9PTMuMS42CmppdGVyPT0wLjE4LjAKam1lc3BhdGg9PTEuMS4wCmpvYmxpYj09MS42LjAKanNvbl9yZXBhaXI9PTAuNjQuMgpqc29uc2NoZW1hPT00LjI2LjAKanNvbnNjaGVtYS1zcGVjaWZpY2F0aW9ucz09MjAyNS45LjEKbGFyay1vYXBpPT0xLjcuNQpsaXRlbGxtPT0xLjEwNi41CmxsYW1hLWluZGV4PT0wLjE0LjI1CmxsYW1hLWluZGV4LWNvcmU9PTAuMTQuMjUKbGxhbWEtaW5kZXgtZW1iZWRkaW5ncy1vcGVuYWk9PTAuNi4wCmxsYW1hLWluZGV4LWluc3RydW1lbnRhdGlvbj09MC42LjAKbGxhbWEtaW5kZXgtbGxtcy1vcGVuYWk9PTAuNy4xMApsbGFtYS1pbmRleC1yZXRyaWV2ZXJzLWJtMjU9PTAuNy4xCmxsYW1hLWluZGV4LXZlY3Rvci1zdG9yZXMtZmFpc3M9PTAuNy4wCmxsYW1hLWluZGV4LXdvcmtmbG93cz09Mi4yNi4xCmxvZ3VydT09MC43LjMKbHhtbD09Ni4xLjMKbWFya2Rvd24taXQtcHk9PTQuMi4wCk1hcmt1cFNhZmU9PTMuMC40Cm1hcnNobWFsbG93PT0zLjI2LjIKbWF4bWluZGRiPT0zLjIuMAptY3A9PTEuMzAuMAptZHVybD09MC4xLjIKbXNncGFjaz09MS4yLjQKbXVsdGlkaWN0PT03LjIuMQpteXB5X2V4dGVuc2lvbnM9PTEuMS4wCm5lc3QtYXN5bmNpbz09MS42LjAKbmV0d29ya3g9PTMuNi4xCm5sdGs9PTMuMTAuNApub2RlZW52PT0xLjExLjAKbnVtcHk9PTIuNC42Cm9hdXRoLWNsaS1raXQ9PTAuMS42Cm9ubnhydW50aW1lPT0xLjMxLjEKb3BlbmFpPT0yLjU0LjAKb3BlbmFpLWFnZW50cz09MC4yMC4wCm9wZW5weXhsPT0zLjEuNQpvcGVudGVsZW1ldHJ5LWFwaT09MS40NS4xCm9wZW50ZWxlbWV0cnktc2RrPT0xLjQ1LjEKb3BlbnRlbGVtZXRyeS1zZW1hbnRpYy1jb252ZW50aW9ucz09MC42NmIxCnBhY2thZ2luZz09MjYuMwpwYWdlaW5kZXg9PTAuMi4yMgpwZGZtaW5lci5zaXg9PTIwMjYwMTA3CnBkZnBsdW1iZXI9PTAuMTEuMTAKcGVycGxleGl0eWFpPT0wLjQ2LjEKcGlsbG93PT0xMy4wLjAKcGxhdGZvcm1kaXJzPT00LjEzLjYKcGx1Z2d5PT0xLjcuMApwb2NrZXRiYXNlPT0wLjE3LjMKcHJlX2NvbW1pdD09NC43LjAKcHJpbXA9PTIuMC4xCnByb21wdF90b29sa2l0PT0zLjAuNTMKcHJvcGNhY2hlPT0wLjUuNApwcm90b2J1Zj09Ny4zNi4yCnBzdXRpbD09Ny4yLjIKcHlhc24xPT0wLjYuNQpweWNwYXJzZXI9PTMuMTIKcHljcnlwdG9kb21lPT00LjIuMApweWRhbnRpYz09Mi4xNC4xCnB5ZGFudGljLXNldHRpbmdzPT0yLjE2LjEKcHlkYW50aWNfY29yZT09Mi41MC4xClB5Z21lbnRzPT0yLjIxLjAKUHlKV1Q9PTIuMTUuMQpweW11cGRmPT0yLjAKcHltdXBkZjRsbG09PTIuMApweW11cGRmX2xheW91dD09Mi4wCnB5cGRmPT02LjIxLjMKUHlQREYyPT0zLjAuMQpweXBkZml1bTI9PTUuMTQuMApQeVN0ZW1tZXI9PTIuMi4wLjMKcHl0ZT09MC44LjIKcHl0ZXN0PT05LjEuMQpweXRlc3QtYXN5bmNpbz09MS40LjEKcHl0aG9uLWRhdGV1dGlsPT0yLjkuMC5wb3N0MApweXRob24tZGlzY292ZXJ5PT0xLjYuNgpweXRob24tZG9jeD09MS4yLjAKcHl0aG9uLWRvdGVudj09MS4yLjQKcHl0aG9uLWVuZ2luZWlvPT00LjE1LjAKcHl0aG9uLWpvc2U9PTMuNS4wCnB5dGhvbi1tdWx0aXBhcnQ9PTAuMC4zMgpweXRob24tcHB0eD09MS4wLjIKcHl0aG9uLXNvY2tldGlvPT01LjE3LjAKcHl0aG9uLXNvY2tzPT0yLjguMgpweXRob24tdGVsZWdyYW0tYm90PT0yMi44ClB5WUFNTD09Ni4wLjMKcXEtYm90cHk9PTEuMi4xCnFyY29kZT09OC4yCnJlZGlzPT02LjQuMApyZWZlcmVuY2luZz09MC4zNy4wCnJlZ2V4PT0yMDI2LjkuMjkKcmVwb3J0bGFiPT01LjEuMApyZXF1ZXN0cz09Mi4zNC4yCnJlcXVlc3RzLXRvb2xiZWx0PT0xLjAuMApyaWNoPT0xNS4wLjAKcnBkcy1weT09MjAyNi45LjEKcnNhPT00LjkuMQpydWZmPT0wLjE2LjAKczN0cmFuc2Zlcj09MC4xOS4zCnNoZWxsaW5naGFtPT0xLjUuNApzaW1wbGUtd2Vic29ja2V0PT0xLjEuMApzaXg9PTEuMTcuMApzbGFja19zZGs9PTMuNDUuMApzbGFja2lmeV9tYXJrZG93bj09MC4yLjQKc25pZmZpbz09MS4zLjEKc29ja3Npbz09MS4wLjAKc29ydGVkY29udGFpbmVycz09Mi40LjAKU1FMQWxjaGVteT09Mi4xLjYKc3NlLXN0YXJsZXR0ZT09My42LjAKc3RhcmxldHRlPT0xLjEwLjAKdGFidWxhdGU9PTAuMTAuMAp0ZW5hY2l0eT09OS4yLjEKdGlrdG9rZW49PTAuMTQuMAp0aW55dGFnPT0yLjMuMgp0b2tlbml6ZXJzPT0wLjIzLjMKdHFkbT09NC43MC4xCnRydXN0c3RvcmU9PTAuMTAuNQp0eXBlcj09MC4yNy4zCnR5cGluZy1pbnNwZWN0PT0wLjkuMAp0eXBpbmctaW5zcGVjdGlvbj09MC40LjQKdHlwaW5nX2V4dGVuc2lvbnM9PTQuMTYuMAp0emRhdGE9PTIwMjYuNQp0emxvY2FsPT01LjQuNQp1cmxsaWIzPT0yLjguMAp1dmljb3JuPT0wLjU0LjAKdXZsb29wPT0wLjIzLjAKdmlydHVhbGVudj09MjEuMTUuMAp3YXRjaGZpbGVzPT0xLjMuMAp3Y3dpZHRoPT0wLjkuNAp3ZWJzb2NrZXQtY2xpZW50PT0xLjkuMgp3ZWJzb2NrZXRzPT0xNS4wLjEKd2Vjb20tYWlib3Qtc2RrPT0xLjAuOAp3cmFwdD09Mi41LjEKd3Nwcm90bz09MS4zLjIKeGxzeHdyaXRlcj09My4zLjAKeWFybD09MS4yNS4xCnlvdXR1YmUtdHJhbnNjcmlwdC1hcGk9PTEuMi40CnppcHA9PTQuMS4yCnp1bGlwPT0wLjkuMQo=' | base64 --decode > "$RUNNER_TEMP/stage1-packages.txt"
+        python - <<'PYSHA'
+        from pathlib import Path
+        import os,hashlib
+        f=Path(os.environ['RUNNER_TEMP'])/'stage1-packages.txt'
+        assert hashlib.sha256(f.read_bytes()).hexdigest()=='ae528f12f3c55f9e89f1f99225818b06214cc73da630e450c0e9de5fbfc6ea45'
+        PYSHA
+        pip install -r "$RUNNER_TEMP/stage1-packages.txt"
+        python --version > "$RUNNER_TEMP/evidence/runtime.txt"
+        node --version >> "$RUNNER_TEMP/evidence/runtime.txt"
+        npm --version >> "$RUNNER_TEMP/evidence/runtime.txt"
+        pip freeze > "$RUNNER_TEMP/evidence/packages.txt"
+        python - <<'PYVERSIONS'
+        import os,pathlib,importlib.metadata as md,json
+        from packaging.requirements import Requirement
+        p=pathlib.Path(os.environ['RUNNER_TEMP']);receipts={}
+        for line in (p/'stage1-packages.txt').read_text().splitlines():
+            if not line.strip() or line.startswith('#'):continue
+            r=Requirement(line);actual=md.version(r.name)
+            assert r.specifier.contains(actual), (r.name,str(r.specifier),actual)
+            receipts[r.name]={'required':str(r.specifier),'installed':actual}
+        (p/'evidence/main-environment-version-match.json').write_text(json.dumps(receipts,indent=2))
+        PYVERSIONS
+        mkdir -p data/user/settings
+        printf 'system:\n  language: en\nlogging:\n  level: WARNING\n' > data/user/settings/main.yaml
+        cp tests/fixtures/ci_model_catalog.json data/user/settings/model_catalog.json
+    - name: Audit required pre-commit once and retain real outcome
+      shell: bash
+      run: |
+        python - <<'PYAUDIT'
+        import os,pathlib,subprocess,json,hashlib
+        p=pathlib.Path(os.environ['RUNNER_TEMP'])/'evidence'
+        r=subprocess.run(['pre-commit','run','--all-files'],capture_output=True,text=True)
+        (p/'precommit.stdout.log').write_text(r.stdout)
+        (p/'precommit.stderr.log').write_text(r.stderr)
+        print(r.stdout+r.stderr)
+        receipt={'precommit_returncode':r.returncode,'source_promotion':False}
+        for label,args in [('source-head-after',['git','rev-parse','HEAD']),('source-tree-after',['git','rev-parse','HEAD^{tree}']),('source-index-after',['git','ls-files','-s']),('tracked-diff',['git','diff','--binary','HEAD','--']),('tracked-status',['git','status','--porcelain=v1','--untracked-files=all'])]:
+            x=subprocess.run(args,capture_output=True,text=True)
+            (p/(label+'.txt')).write_text(x.stdout+x.stderr)
+            receipt[label+'_returncode']=x.returncode
+        receipt['head_unchanged']=(p/'source-head-before.txt').read_text()==(p/'source-head-after.txt').read_text()
+        receipt['index_unchanged']=(p/'source-index-before.txt').read_text()==(p/'source-index-after.txt').read_text()
+        receipt['tracked_worktree_mutated']=bool((p/'tracked-diff.txt').read_text().strip())
+        (p/'precommit-audit-receipt.json').write_text(json.dumps(receipt,indent=2))
+        # Capture hook source revisions and isolated environment versions for future
+        # exact replay. Stage1 did not retain these transient environment freezes.
+        cache=pathlib.Path(os.environ.get('PRE_COMMIT_HOME',str(pathlib.Path.home()/'.cache/pre-commit')))
+        for repo in sorted(cache.glob('repo*')):
+            if not repo.is_dir():continue
+            rev=subprocess.run(['git','rev-parse','HEAD'],cwd=repo,capture_output=True,text=True)
+            if rev.returncode==0:(p/('hook-'+repo.name+'-revision.txt')).write_text(rev.stdout)
+            for python in repo.glob('py_env-*/bin/python'):
+                v=subprocess.run([str(python),'-m','pip','freeze'],capture_output=True,text=True)
+                (p/('hook-'+repo.name+'-'+python.parent.parent.name+'-freeze.txt')).write_text(v.stdout+v.stderr)
+        assert receipt['head_unchanged'] and receipt['index_unchanged'], receipt
+        # Preserve actual pre-commit failure as the job outcome. A diagnostic receipt
+        # is never equivalent to passing the repository's required gate.
+        raise SystemExit(r.returncode)
+        PYAUDIT
+    - name: Always preserve source/index/mutation receipts
+      if: always()
+      shell: bash
+      run: |
+        python - <<'PYAFTER'
+        import os,pathlib,subprocess,json
+        p=pathlib.Path(os.environ['RUNNER_TEMP'])/'evidence';p.mkdir(exist_ok=True)
+        r={}
+        for name,cmd in [('head',['git','rev-parse','HEAD']),('tree',['git','rev-parse','HEAD^{tree}']),('index',['git','ls-files','-s']),('worktree-diff',['git','diff','--binary','HEAD','--']),('status',['git','status','--porcelain=v1','--untracked-files=all'])]:
+            x=subprocess.run(cmd,capture_output=True,text=True);(p/('always-after-'+name+'.txt')).write_text(x.stdout+x.stderr);r[name+'_returncode']=x.returncode
+        (p/'always-after-source-receipt.json').write_text(json.dumps(r,indent=2))
+        PYAFTER
+    - name: Preserve diagnostic evidence
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: deeptutor-exact-dev-precommit-baseline
+        path: ${{ runner.temp }}/evidence
+        retention-days: 7
+        if-no-files-found: error
