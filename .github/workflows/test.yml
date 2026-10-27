@@ -1,125 +1,84 @@
-name: CI
-
+name: Vibe2051 exact-head review repair qualification
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
   workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
+permissions:
+  contents: read
 jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
+        python-version: ["3.11", "3.14"]
     steps:
-      # actions/checkout v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
+        with:
+          repository: HKUDS/Vibe-Trading
+          ref: 6892d1cb790012694582da704bc76e476d5cf726
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
+      - name: Verify exact original PR head
+        run: test "$(git rev-parse HEAD)" = 6892d1cb790012694582da704bc76e476d5cf726
+      - name: Install upstream CI extras and record exact resolved versions
         run: |
+          python -m pip install -e ".[dev,openbb,stats,anthropic,matrix]"
+          mkdir -p .qualification
+          python -VV | tee .qualification/python.txt
+          python -m pip freeze > .qualification/pip-freeze.txt
+      - name: Verify upstream CI optional extras
+        run: |
+          python -c "import nio; from src.channels.matrix import MatrixChannel"
           python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
           python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
           python -c "import arch; print('arch', arch.__version__)"
           python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
+      - name: Materialize frozen patch and baseline manual controls
+        shell: python
+        run: |
+          import base64, pathlib, hashlib
+          p=pathlib.Path(".qualification");p.mkdir(exist_ok=True)
+          patch=base64.b64decode("LS0tIGEvd2lraS9hbHBoYS1saWJyYXJ5L2kxOG4uemguanNvbgorKysgYi93aWtpL2FscGhhLWxpYnJhcnkvaTE4bi56aC5qc29uCkBAIC0zMDEsOCArMzAxLDggQEAKICAgICJ6aCI6ICLmiJDkuqTph4/mjpLlkI3kuI4gdndhcCDmjpLlkI3nmoTmu5rliqjnm7jlhbPns7vmlbDvvIzlhbbmjpLlkI3lnKggNSDml6XlhoXnmoTmnIDlpKflgLzjgIIiCiAgIH0sCiAgICJndGphMTkxXzAxNyI6IHsKLSAgICJlbiI6ICJyYW5rKHZ3YXAgLSAxNWQgbWF4KHZ3YXApKSBpcyBub24tcG9zaXRpdmU7IHdlIHVzZSBzaWduZWRfcG93ZXIgZm9yIHNhZmV0eS4iLAotICAgInpoIjogInJhbmsodndhcCAtIDE1IOaXpSBtYXgodndhcCkpIOmdnuato++8m+S4uueos+Wmpei1t+ingeS9v+eUqCBzaWduZWRfcG93ZXLvvIjluKbnrKblj7fluYLvvInjgIIiCisgICAiZW4iOiAiVGhlIGJhc2UgaXMgYSBwZXJjZW50aWxlIHJhbmsgaW4gKDAsIDFdLCBzbyBhIG5lZ2F0aXZlIDUtZGF5IGNsb3NlIGNoYW5nZSBpcyBhIHJlYWwgcG93ZXIsIG5vdCBhIGNvbXBsZXggb25lLiIsCisgICAiemgiOiAi5bqV5pWw5pivICgwLCAxXSDlhoXnmoTnmb7liIbkvY3mjpLlkI3vvIzlm6DmraTljbPkvb8gNSDml6XmlLbnm5jku7flj5jljJbkuLrotJ/vvIzluYLov5DnrpfnmoTnu5Pmnpzku43kuLrlrp7mlbDvvIzogIzpnZ7lpI3mlbDjgIIiCiAgIH0sCiAgICJndGphMTkxXzAxOCI6IHsKICAgICJlbiI6ICI1ZCBwcmljZSByYXRpby4iLAotLS0gYS9hZ2VudC90ZXN0cy9mYWN0b3JzL2ZpeHR1cmVzL2dvbGRlbnMvZ3RqYTE5MV8wMTcuY3N2CisrKyBiL2FnZW50L3Rlc3RzL2ZhY3RvcnMvZml4dHVyZXMvZ29sZGVucy9ndGphMTkxXzAxNy5jc3YKQEAgLTEzLDE5ICsxMywxOSBAQAogMjAyNC0wMS0xMiwsLCwsCiAyMDI0LTAxLTEzLCwsLCwKIDIwMjQtMDEtMTQsLCwsLAotMjAyNC0wMS0xNSwxLjAsMC45ODc1NjY4MDExMjIwNTY0LDAuNTYyOTUzOTIwMTA3MzI3LDAuMjE1ODk0MzUyMDM2MTY5MTYsMC40ODc5ODEyMDU1NTUzNDMyCi0yMDI0LTAxLTE2LDEuMCwwLjg4ODgxNzEzOTE4ODM5OTksMC42ODI4MzAyMzA2NDgwMjgzLDAuMzQ3NjQ1MzgxNzg3MTMzOCwwLjAwMzc4ODkxMDExMDU1ODEzOQotMjAyNC0wMS0xNywwLjY2MzE2MDI5MDQ2NzY2MTcsMS4wLDAuNTg3Nzg2OTQzNjIzMDAyMywwLjc1NzE4MTMyMjExMjIwNjIsMC4wMDAyMTQ1NDgxMzQ3NDcxODgzMgotMjAyNC0wMS0xOCwwLjM5NTA1MjQzNzQ4ODI5MDU1LDEuMCwwLjU3NTU5MTQyNjYxODk3NzMsMC40MTExNDQyMjg0NTc5MDg0LDAuMDAwMTMyNTQxNTY4NDM4MTE1MzYKLTIwMjQtMDEtMTksMC44ODI3MzkzMDY3MjY3NjMsMS4wLDAuNjc0ODg1MzUwNzc3MjAzMiwwLjc3MzIwMjk3ODgzNzkxOTQsMC4wMDAxOTkxNTg4NTcyNjQ3NjE4NAotMjAyNC0wMS0yMCwwLjMxMzQ4OTAyNzE5NDMxMDcsMS4wLDAuNzg4MTkxNzg3NDgwMzM0OCwwLjUyMDM1MDIzMDUxNjgwOCwwLjAwOTI1NDUxMTU3Mjc0NDM4Ci0yMDI0LTAxLTIxLDAuMDQwMzU3MjcyNjY5NTA1MywxLjAsMC43OTU5MTY2MDg4NjU0NjgzLDAuMzI5NTc1MjAzMzYzODg4OTYsMC4xNzQ5MzI1NzE4MzIwMzI1Ci0yMDI0LTAxLTIyLDAuMDcxNDcwMzcyMTUwMDc3NjIsMS4wLDAuOTM5MzUxMjk3Mzg2NjE1LDAuNDg5ODU3MDQ3NzI5OTUxNCwwLjU3MDA5NjAwMzA1MjcyNzMKLTIwMjQtMDEtMjMsMC4wMTk1MDkxOTc3ODg0NzAwMSwwLjU0Njk4NTA4NTgyNTU0NDEsMC43NTU0ODU3MjcxODQyODg0LDEuMCwwLjE4MzExOTYzNDA4MDYzMjQ4Ci0yMDI0LTAxLTI0LDAuMDIzNTI5MTQzNzQzNDU4NjQsMC42ODQyNDM2OTA4NjI5MjA2LDAuNTk1MjU5MTgyNTk2NzQxLDEuMCwwLjg2NjE5Mjg5MTk0NjQzCi0yMDI0LTAxLTI1LDAuMTg1Njg2NTg3MDY2OTk1MTIsMC44OTU0NDAxNjY3MzY4MDM4LDEuMCwwLjQyODM5NTQ4NzE3MzM5NTc2LDAuMjMwOTEzNzIxNDU1NzY1MQotMjAyNC0wMS0yNiwwLjQwNTIzMDAzNDYwNDIzOTM0LDAuOTMzNjE3NTY2NjUxODU1LDEuMCwwLjU2NDY0MTk5OTUxMzgwODYsMC40MDA1MjU1NjkwMTEwMjQ1NAotMjAyNC0wMS0yNywwLjg0Mjk5MzIzNDg0ODkyMTcsMC42NTU1MjUyNDY0NzU1MjEyLDAuNTA1ODIxNDA3MTc2MDIyMywxLjAsMC42NDA4NDgzMjcxNzAzNTczCi0yMDI0LTAxLTI4LDAuNDgwNzQxNTg3ODY3NTIzMTMsMC4wODgyNTI1NDU2NDEwMzY5NiwwLjQxNjA4OTAyODEyMTMwNDc3LDEuMCwwLjEyMDQ2ODIzOTI1MDM2MTE1Ci0yMDI0LTAxLTI5LDAuMTk0MjA1MTQ5NTEwNzc5ODgsMC43NDY5NTI0MTM5NDk1MzgyLDAuMTM4NzcxMTcwOTY0NTg2NywxLjAsMC4wNTQ1Njg3NzUxMjEzMzUyMQotMjAyNC0wMS0zMCwwLjQ4OTc2MDcyNjkwNzYwMiwwLjIyMzUzOTUyMTcyMTU1MTUsMC4wMDAzODkwNDc4MDk3Nzg1MTYzLDEuMCwwLjM0MjYxNDc2OTU2CisyMDI0LTAxLTE1LDEuMCwwLjk4NzU2NjgwMTEyMjA1NjQsMS43NzYzNDQzMjI4MzQzNjM0LDAuMjE1ODk0MzUyMDM2MTY5MTYsMi4wNDkyNTkyNTE0MTMwOTA1CisyMDI0LTAxLTE2LDEuMCwwLjg4ODgxNzEzOTE4ODM5OTksMS40NjQ0OTI4NjM4NDI1NTAxLDAuMzQ3NjQ1MzgxNzg3MTMzOCwyNjMuOTI4MTQwNDk5NjY3NjgKKzIwMjQtMDEtMTcsMC42NjMxNjAyOTA0Njc2NjE3LDEuMCwwLjU4Nzc4Njk0MzYyMzAwMjMsMC43NTcxODEzMjIxMTIyMDYyLDQ2NjAuOTU4NzIyMjg1NTM2MgorMjAyNC0wMS0xOCwwLjM5NTA1MjQzNzQ4ODI5MDU1LDEuMCwwLjU3NTU5MTQyNjYxODk3NzMsMC40MTExNDQyMjg0NTc5MDg0LDc1NDQuODAyODI1MTM3MTM3CisyMDI0LTAxLTE5LDAuODgyNzM5MzA2NzI2NzYzLDEuMCwwLjY3NDg4NTM1MDc3NzIwMzIsMC43NzMyMDI5Nzg4Mzc5MTk0LDUwMjEuMTE3MzgyMDQzNDE5NgorMjAyNC0wMS0yMCwzLjE4OTkwNDMxMzIzODI2NjcsMS4wLDAuNzg4MTkxNzg3NDgwMzM0OCwxLjkyMTc4MjU2MzY1Mjk2MDQsMTA4LjA1NTQwNTQyNDY0OTAxCisyMDI0LTAxLTIxLDI0Ljc3ODY4MTM1OTEwMDMyNSwxLjAsMC43OTU5MTY2MDg4NjU0NjgzLDMuMDM0MjA4ODUzNjc5NzAxNiw1LjcxNjQ4ODI5OTA0NjkyNzcKKzIwMjQtMDEtMjIsMTMuOTkxODExODUwMzcyNjU4LDEuMCwxLjA2NDU2NDQ1MjkxNzc5MiwyLjA0MTQxMTg4NjY1OTgwMDMsMS43NTQwOTA1Mjk3NDQ1MzQyCisyMDI0LTAxLTIzLDUxLjI1Nzg3Mzg5MzI1Njc4NiwwLjU0Njk4NTA4NTgyNTU0NDEsMS4zMjM2NTE3NDM1MzA2NDQzLDEuMCw1LjQ2MDkxMDg2ODU3Mjc5OTYKKzIwMjQtMDEtMjQsNDIuNTAwNDg0MTE4ODkyMzgxLDAuNjg0MjQzNjkwODYyOTIwNiwxLjY3OTk0MDQ4NTE0NzM3NjcsMS4wLDAuODY2MTkyODkxOTQ2NDMKKzIwMjQtMDEtMjUsNS4zODU0MTg2MDEyODY0OTY2LDAuODk1NDQwMTY2NzM2ODAzOCwxLjAsMC40MjgzOTU0ODcxNzMzOTU3NiwwLjIzMDkxMzcyMTQ1NTc2NTEKKzIwMjQtMDEtMjYsMC40MDUyMzAwMzQ2MDQyMzkzNCwxLjA3MTEwMjM4MjUxNjQzNjcsMS4wLDAuNTY0NjQxOTk5NTEzODA4NiwwLjQwMDUyNTU2OTAxMTAyNDU0CisyMDI0LTAxLTI3LDEuMTg2MjQ5MTQwMTU5NzI2OCwxLjUyNTQ5NDI1ODgwNDc4NjIsMS45NzY5ODIzNjEzODkwODAyLDEuMCwxLjU2MDQzMTYzMDM5MTMzNDQKKzIwMjQtMDEtMjgsMC40ODA3NDE1ODc4Njc1MjMxMywxMS4zMzExMTc5MDQxNTAzNTIsMi40MDMzMzE4MTcwMjc1NDM1LDEuMCw4LjMwMDk0MzEwNTE5Mjc4MjcKKzIwMjQtMDEtMjksMC4xOTQyMDUxNDk1MTA3Nzk4OCwxLjMzODc3MzM2OTM5MzcyNTQsNy4yMDYxMDc2NzM4NzExOTczLDEuMCwxOC4zMjU0OTgzNzg0NDk0MjgKKzIwMjQtMDEtMzAsMC40ODk3NjA3MjY5MDc2MDIsNC40NzM0ODE4ODA1MTM0MzQyLDI1NzAuMzc4MTc2ODM0NjA3NSwxLjAsMi45MTg3Mjk5ODE0NDMxMjcxCi0tLSBhL2FnZW50L3Rlc3RzL2ZhY3RvcnMvdGVzdF9ndGphMTkxX2FscGhhMDE3X3Bvd2VyLnB5CisrKyBiL2FnZW50L3Rlc3RzL2ZhY3RvcnMvdGVzdF9ndGphMTkxX2FscGhhMDE3X3Bvd2VyLnB5CkBAIC0zMiwzICszMiwyNyBAQAogICAgIGFzc2VydCBnb3RbIkEiXSA9PSA0LjAKICAgICBhc3NlcnQgZ290WyJCIl0gPT0gMS4wCiAgICAgYXNzZXJ0IG5vdCBucC5pc2Nsb3NlKGdvdFsiQSJdLCAwLjI1KQorCisKK2RlZiB0ZXN0X3NpZ25lZF9wb3dlcl9tYXRjaGVzX2hhbmRfY2FsY3VsYXRlZF93aWRlcl9wYW5lbF93aXRob3V0X211dGF0aW9uKCk6CisgICAgaWR4ID0gcGQuYmRhdGVfcmFuZ2UoIjIwMjQtMDEtMDEiLCBwZXJpb2RzPTIwKQorICAgIGNvbHVtbnMgPSBsaXN0KCJBQkNERSIpCisgICAgY2xvc2UgPSBwZC5EYXRhRnJhbWUoMTAuMCwgaW5kZXg9aWR4LCBjb2x1bW5zPWNvbHVtbnMpCisgICAgY2xvc2UuaWxvY1stMV0gPSBbOC4wLCAxMC4wLCAxMi4wLCA5LjAsIDExLjBdCisgICAgdndhcCA9IHBkLkRhdGFGcmFtZSgxMC4wLCBpbmRleD1pZHgsIGNvbHVtbnM9Y29sdW1ucykKKyAgICB2d2FwLmlsb2NbLTFdID0gWzIuMCwgNC4wLCA2LjAsIDguMCwgMTAuMF0KKyAgICBwYW5lbCA9IHsKKyAgICAgICAgImNsb3NlIjogY2xvc2UsICJ2d2FwIjogdndhcCwKKyAgICAgICAgInZvbHVtZSI6IHBkLkRhdGFGcmFtZSgxLjAsIGluZGV4PWlkeCwgY29sdW1ucz1jb2x1bW5zKSwKKyAgICAgICAgImFtb3VudCI6IHBkLkRhdGFGcmFtZSgxLjAsIGluZGV4PWlkeCwgY29sdW1ucz1jb2x1bW5zKSwKKyAgICB9CisgICAgb3JpZ2luYWwgPSB7bmFtZTogZnJhbWUuY29weShkZWVwPVRydWUpIGZvciBuYW1lLCBmcmFtZSBpbiBwYW5lbC5pdGVtcygpfQorCisgICAgZ290ID0gYWxwaGFfMDE3LmNvbXB1dGUocGFuZWwpCisKKyAgICAjIFJhbmtlZCBkaWZmZXJlbmNlcyAtOCwtNiwtNCwtMiwwIGdpdmUgLjIsLjQsLjYsLjgsMS4gU2lnbmVkIGRlbHRhcworICAgICMgLTIsMCwyLC0xLDEgZ2l2ZSAyNSwxLC4zNiwxLjI1LDEgZGlyZWN0bHkgZnJvbSB0aGUgcmVwb3J0J3MgZm9ybXVsYS4KKyAgICBucC50ZXN0aW5nLmFzc2VydF9hbGxjbG9zZShnb3QuaWxvY1stMV0sIFsyNS4wLCAxLjAsIDAuMzYsIDEuMjUsIDEuMF0pCisgICAgYXNzZXJ0IGdvdC5pbG9jWzoxNF0uaXNuYSgpLmFsbCgpLmFsbCgpCisgICAgZm9yIG5hbWUsIGZyYW1lIGluIHBhbmVsLml0ZW1zKCk6CisgICAgICAgIHBkLnRlc3RpbmcuYXNzZXJ0X2ZyYW1lX2VxdWFsKGZyYW1lLCBvcmlnaW5hbFtuYW1lXSkK")
+          assert hashlib.sha256(patch).hexdigest()=="6ade7067bcd6b05ccd0a53cf3a348f8d937ecac0905712b3c07dc3a43320a21e"
+          (p/"repair.patch").write_bytes(patch)
+          (p/"scalar_oracle.py").write_bytes(base64.b64decode("aW1wb3J0IGNzdiwgbWF0aCwganNvbgpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKaW1wb3J0IG51bXB5IGFzIG5wCnJuZz1ucC5yYW5kb20uUmFuZG9tU3RhdGUoNDIpCmNsb3NlPW5wLmFicygxMDArbnAuY3Vtc3VtKHJuZy5ub3JtYWwoMCwxLCgzMCw1KSksYXhpcz0wKSkrMQpybmcudW5pZm9ybSgwLDEsKDMwLDUpKTtybmcudW5pZm9ybSgwLDEsKDMwLDUpKQp2b2x1bWU9cm5nLnJhbmRpbnQoMTAwMCwxMDAwMDAsKDMwLDUpKS5hc3R5cGUoZmxvYXQpCmFtb3VudD12b2x1bWUqY2xvc2UqMTAwCnZ3PWFtb3VudCoxMDAwLyh2b2x1bWUqMTAwKzEpCnJvd3M9W10KZm9yIGRheSBpbiByYW5nZSgzMCk6CiAgICBpZiBkYXk8MTQ6CiAgICAgICAgcm93cy5hcHBlbmQoW2Zsb2F0KCJuYW4iKV0qNSk7Y29udGludWUKICAgIGRpZmZlcmVuY2VzPVt2d1tkYXksal0tbWF4KHZ3W2RheS0xNDpkYXkrMSxqXSkgZm9yIGogaW4gcmFuZ2UoNSldCiAgICB2YWx1ZXM9W10KICAgIGZvciBqLHggaW4gZW51bWVyYXRlKGRpZmZlcmVuY2VzKToKICAgICAgICByYW5rPShzdW0oeTx4IGZvciB5IGluIGRpZmZlcmVuY2VzKSsoc3VtKHk9PXggZm9yIHkgaW4gZGlmZmVyZW5jZXMpKzEpLzIpLzUKICAgICAgICB2YWx1ZXMuYXBwZW5kKG1hdGgucG93KHJhbmssZmxvYXQoY2xvc2VbZGF5LGpdLWNsb3NlW2RheS01LGpdKSkpCiAgICByb3dzLmFwcGVuZCh2YWx1ZXMpCmZpeHR1cmU9UGF0aCgiYWdlbnQvdGVzdHMvZmFjdG9ycy9maXh0dXJlcy9nb2xkZW5zL2d0amExOTFfMDE3LmNzdiIpCmFjdHVhbD1saXN0KGNzdi5yZWFkZXIoZml4dHVyZS5vcGVuKCkpKQphc3NlcnQgYWN0dWFsWzBdPT1bIiIsIkEiLCJCIiwiQyIsIkQiLCJFIl0KYXNzZXJ0IGxlbihhY3R1YWwpPT0zMQpmb3IgaSwgZXhwZWN0ZWQgaW4gZW51bWVyYXRlKHJvd3MpOgogICAgZm9yIGosdmFsdWUgaW4gZW51bWVyYXRlKGV4cGVjdGVkKToKICAgICAgICBjZWxsPWFjdHVhbFtpKzFdW2orMV0KICAgICAgICBpZiBtYXRoLmlzbmFuKHZhbHVlKTogYXNzZXJ0IGNlbGw9PSIiLChpLGosY2VsbCkKICAgICAgICBlbHNlOiBhc3NlcnQgbWF0aC5pc2Nsb3NlKGZsb2F0KGNlbGwpLHZhbHVlLHJlbF90b2w9MWUtMTIpLChpLGosY2VsbCx2YWx1ZSkKcHJpbnQoanNvbi5kdW1wcyh7Im9yYWNsZSI6InNjYWxhcjE1cm93bWF4L3RpZWF2ZXJhZ2VyYW5rL3NpZ25lZDVkYXlkZWx0YS9tYXRoLnBvdzsgbm8gcHJvZHVjdGlvbiBpbXBvcnRzIiwgInJvd3MiOjMwLCJmaW5pdGVfY2VsbHMiOjgwLCJ3YXJtdXBfbmFuX2NlbGxzIjo3MCwibWF0Y2hlcyI6VHJ1ZX0pKQo="))
+          pathlib.Path("agent/tests/factors/test_gtja191_alpha017_power.py").write_bytes(base64.b64decode("IiIiR1RKQSAjMTcgcmFpc2VzIHRoZSBwZXJjZW50aWxlIHJhbmsgdG8gdGhlIHNpZ25lZCA1LWRheSBjbG9zZSBjaGFuZ2UuCgpBIHJhbmsgb2YgMC41IGFuZCBhIGNsb3NlIGNoYW5nZSBvZiAtMiBpcyAwLjUgKiogLTIgPSA0LiBUYWtpbmcgdGhlIGFic29sdXRlCnZhbHVlIG9mIHRoZSBleHBvbmVudCByZXBvcnRlZCAwLjI1LgoiIiIKCmZyb20gX19mdXR1cmVfXyBpbXBvcnQgYW5ub3RhdGlvbnMKCmltcG9ydCBudW1weSBhcyBucAppbXBvcnQgcGFuZGFzIGFzIHBkCgpmcm9tIHNyYy5mYWN0b3JzLnpvby5ndGphMTkxIGltcG9ydCBhbHBoYV8wMTcKCgpkZWYgdGVzdF9uZWdhdGl2ZV9jbG9zZV9jaGFuZ2VfaW52ZXJ0c190aGVfcmFua19wb3dlcigpOgogICAgaWR4ID0gcGQuYmRhdGVfcmFuZ2UoIjIwMjQtMDEtMDEiLCBwZXJpb2RzPTIwKQogICAgY2xvc2UgPSBwZC5EYXRhRnJhbWUoMTAuMCwgaW5kZXg9aWR4LCBjb2x1bW5zPVsiQSIsICJCIl0pCiAgICBjbG9zZS5pbG9jWy0xXSA9IFs4LjAsIDEyLjBdCiAgICB2d2FwID0gcGQuRGF0YUZyYW1lKDEwLjAsIGluZGV4PWlkeCwgY29sdW1ucz1bIkEiLCAiQiJdKQogICAgdndhcC5pbG9jWy0xXSA9IFs4LjAsIDEwLjBdCiAgICBwYW5lbCA9IHsKICAgICAgICAiY2xvc2UiOiBjbG9zZSwKICAgICAgICAidndhcCI6IHZ3YXAsCiAgICAgICAgInZvbHVtZSI6IHBkLkRhdGFGcmFtZSgxLjAsIGluZGV4PWlkeCwgY29sdW1ucz1bIkEiLCAiQiJdKSwKICAgICAgICAiYW1vdW50IjogcGQuRGF0YUZyYW1lKDEuMCwgaW5kZXg9aWR4LCBjb2x1bW5zPVsiQSIsICJCIl0pLAogICAgfQoKICAgIGdvdCA9IGFscGhhXzAxNy5jb21wdXRlKHBhbmVsKS5pbG9jWy0xXQoKICAgICMgdndhcCAtIDE1LWRheSBtYXggaXMgLTIgYW5kIDAsIHNvIHRoZSBwZXJjZW50aWxlIHJhbmtzIGFyZSAwLjUgYW5kIDEuCiAgICAjIERlbHRhcyBhcmUgLTIgYW5kICsyLgogICAgYXNzZXJ0IGdvdFsiQSJdID09IDQuMAogICAgYXNzZXJ0IGdvdFsiQiJdID09IDEuMAogICAgYXNzZXJ0IG5vdCBucC5pc2Nsb3NlKGdvdFsiQSJdLCAwLjI1KQoKCmRlZiB0ZXN0X3NpZ25lZF9wb3dlcl9tYXRjaGVzX2hhbmRfY2FsY3VsYXRlZF93aWRlcl9wYW5lbF93aXRob3V0X211dGF0aW9uKCk6CiAgICBpZHggPSBwZC5iZGF0ZV9yYW5nZSgiMjAyNC0wMS0wMSIsIHBlcmlvZHM9MjApCiAgICBjb2x1bW5zID0gbGlzdCgiQUJDREUiKQogICAgY2xvc2UgPSBwZC5EYXRhRnJhbWUoMTAuMCwgaW5kZXg9aWR4LCBjb2x1bW5zPWNvbHVtbnMpCiAgICBjbG9zZS5pbG9jWy0xXSA9IFs4LjAsIDEwLjAsIDEyLjAsIDkuMCwgMTEuMF0KICAgIHZ3YXAgPSBwZC5EYXRhRnJhbWUoMTAuMCwgaW5kZXg9aWR4LCBjb2x1bW5zPWNvbHVtbnMpCiAgICB2d2FwLmlsb2NbLTFdID0gWzIuMCwgNC4wLCA2LjAsIDguMCwgMTAuMF0KICAgIHBhbmVsID0gewogICAgICAgICJjbG9zZSI6IGNsb3NlLCAidndhcCI6IHZ3YXAsCiAgICAgICAgInZvbHVtZSI6IHBkLkRhdGFGcmFtZSgxLjAsIGluZGV4PWlkeCwgY29sdW1ucz1jb2x1bW5zKSwKICAgICAgICAiYW1vdW50IjogcGQuRGF0YUZyYW1lKDEuMCwgaW5kZXg9aWR4LCBjb2x1bW5zPWNvbHVtbnMpLAogICAgfQogICAgb3JpZ2luYWwgPSB7bmFtZTogZnJhbWUuY29weShkZWVwPVRydWUpIGZvciBuYW1lLCBmcmFtZSBpbiBwYW5lbC5pdGVtcygpfQoKICAgIGdvdCA9IGFscGhhXzAxNy5jb21wdXRlKHBhbmVsKQoKICAgICMgUmFua2VkIGRpZmZlcmVuY2VzIC04LC02LC00LC0yLDAgZ2l2ZSAuMiwuNCwuNiwuOCwxLiBTaWduZWQgZGVsdGFzCiAgICAjIC0yLDAsMiwtMSwxIGdpdmUgMjUsMSwuMzYsMS4yNSwxIGRpcmVjdGx5IGZyb20gdGhlIHJlcG9ydCdzIGZvcm11bGEuCiAgICBucC50ZXN0aW5nLmFzc2VydF9hbGxjbG9zZShnb3QuaWxvY1stMV0sIFsyNS4wLCAxLjAsIDAuMzYsIDEuMjUsIDEuMF0pCiAgICBhc3NlcnQgZ290Lmlsb2NbOjE0XS5pc25hKCkuYWxsKCkuYWxsKCkKICAgIGZvciBuYW1lLCBmcmFtZSBpbiBwYW5lbC5pdGVtcygpOgogICAgICAgIHBkLnRlc3RpbmcuYXNzZXJ0X2ZyYW1lX2VxdWFsKGZyYW1lLCBvcmlnaW5hbFtuYW1lXSkK"))
+      - name: Prove two baseline failures and two unchanged manual controls
+        shell: python
+        run: |
+          import subprocess,xml.etree.ElementTree as ET,json
+          args=["python","-m","pytest","agent/tests/factors/test_alpha_library_translations.py::test_every_english_text_has_a_current_chinese_version[notes-notes]","agent/tests/factors/test_gtja191_part1_samples.py::test_gtja191_sample_matches_golden[gtja191_017]","agent/tests/factors/test_gtja191_alpha017_power.py","-q","-ra","--junitxml=.qualification/baseline.xml"]
+          result=subprocess.run(args)
+          root=ET.parse(".qualification/baseline.xml").getroot()
+          cases=list(root.iter("testcase")); failures=[c.attrib["name"] for c in cases if c.find("failure") is not None]
+          assert result.returncode==1,("baseline exit",result.returncode)
+          assert len(cases)==4 and len(failures)==2,(len(cases),failures)
+          assert set(failures)=={"test_every_english_text_has_a_current_chinese_version[notes-notes]","test_gtja191_sample_matches_golden[gtja191_017]"},failures
+          assert not list(root.iter("error")) and not list(root.iter("skipped"))
+          print(json.dumps({"baseline_cases":4,"failures":failures,"manual_controls_pass":2}))
+      - name: Apply exact three-file repair
+        run: |
+          git checkout -- agent/tests/factors/test_gtja191_alpha017_power.py
+          git apply --check .qualification/repair.patch
+          git apply .qualification/repair.patch
+          python .qualification/scalar_oracle.py | tee .qualification/oracle.json
+      - name: Guard candidate source before execution
+        shell: python
+        run: |
+          import subprocess,hashlib,json,pathlib
+          expected={'wiki/alpha-library/i18n.zh.json': '1d1f349b2fdf7d3066af9efe198fddee0f5e8feecc21af29f331c79a95f71d33', 'agent/tests/factors/fixtures/goldens/gtja191_017.csv': '89713710648c2d000df50276bded00f387ed542f81e4c4c4ec487a231d5a50a3', 'agent/tests/factors/test_gtja191_alpha017_power.py': 'c17703ad49cc6f918bf8b11ad21fa8bd6ab80582999ab5a930aef1d8218b48ca'}
+          changed=set(subprocess.check_output(["git","diff","--name-only"],text=True).splitlines())
+          assert changed==set(expected),(changed,expected)
+          for path,sha in expected.items(): assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==sha,path
+          subprocess.run(["git","diff","--check"],check=True)
+          print(json.dumps({"source_guard":"PASS","expected":expected}))
+      - name: Upstream repository safety gates
+        run: |
+          bash tools/ci_grep_gates.sh
+          pytest tools/test_ci_env_var_gate.py tools/test_ci_private_files_gate.py -q
+      - name: Upstream syntax checks
         run: |
           cd agent
           python -m compileall -q cli
@@ -128,122 +87,37 @@ jobs:
           python -m py_compile src/agent/loop.py
           python -m py_compile src/tools/__init__.py
           python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
+      - name: Required focused factor gates
         run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+          pytest agent/tests/factors/test_gtja191_alpha017_power.py
+          agent/tests/factors/test_gtja191_part1_samples.py
+          agent/tests/factors/test_alpha_library_translations.py
+          agent/tests/factors/test_alpha_purity.py
+          agent/tests/factors/test_lookahead.py
+          -q -ra --junitxml=.qualification/focused.xml
+      - name: Full upstream Python CI suite
+        run: >-
+          pytest --ignore=agent/tests/e2e_backtest
+          --ignore=agent/tests/test_e2e_harness_v2.py
+          --cov=agent --cov-report=term-missing --cov-report=xml
+          --tb=short -q --junitxml=.qualification/full.xml
+      - name: Guard candidate source after execution
+        if: always()
+        shell: python
+        run: |
+          import subprocess,hashlib,json,pathlib
+          expected={'wiki/alpha-library/i18n.zh.json': '1d1f349b2fdf7d3066af9efe198fddee0f5e8feecc21af29f331c79a95f71d33', 'agent/tests/factors/fixtures/goldens/gtja191_017.csv': '89713710648c2d000df50276bded00f387ed542f81e4c4c4ec487a231d5a50a3', 'agent/tests/factors/test_gtja191_alpha017_power.py': 'c17703ad49cc6f918bf8b11ad21fa8bd6ab80582999ab5a930aef1d8218b48ca'}
+          changed=set(subprocess.check_output(["git","diff","--name-only"],text=True).splitlines())
+          assert changed==set(expected),(changed,expected)
+          for path,sha in expected.items(): assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==sha,path
+          subprocess.run(["git","diff","--check"],check=True)
+          print(json.dumps({"source_guard":"PASS","expected":expected}))
+      - name: Upload proof artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+          name: vibe2051-${{ matrix.python-version }}
+          path: |
+            .qualification/
+            coverage.xml
+          if-no-files-found: error
