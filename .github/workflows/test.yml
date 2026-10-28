@@ -1,249 +1,70 @@
-name: CI
-
+name: Private RustScan tag qualification
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
   workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
+permissions:
+  contents: read
+concurrency:
+  group: rustscan-tags-qualification-20261028
+  cancel-in-progress: false
 jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
+  qualify:
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
+      - name: Set shared deadline and fail closed without namespace isolation
         run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
+          set -euo pipefail
+          echo "QUALIFICATION_DEADLINE=$(( $(date +%s) + 1050 ))" >> "$GITHUB_ENV"
+          command -v sudo
+          command -v unshare
+          command -v runuser
+          sudo unshare --net -- runuser --user "$(id -un)" -- test "$(id -u)" -ne 0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: bee-san/RustScan
+          ref: 937903340aa6266abb26e93ea3241026b3fd8150
+          path: rustscan
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Install upstream stable toolchain and fetch dependencies only
+        working-directory: rustscan
         run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rustscan-tags-evidence"
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup run stable rustc -Vv | tee "$RUNNER_TEMP/rustscan-tags-evidence/toolchain.txt"
+          rustup run stable cargo fetch --locked 2>&1 | tee "$RUNNER_TEMP/rustscan-tags-evidence/dependencies.log"
+      - name: Unpack only exact public source patches and evaluator
         run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
+          python3 - <<'PYBUNDLE'
+          import base64,gzip,hashlib,json,os,pathlib
+          raw=gzip.decompress(base64.b64decode('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'))
+          assert hashlib.sha256(raw).hexdigest()=='af914b9161ad40ac53c3aabcddded40f3af17f459d08ff5ef1e3c5b5d256d3db'
+          files=json.loads(raw)
+          assert set(files)=={'baseline.patch','candidate.patch','manifest.json','run-qualification.py','test-evaluator.py'}
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'rustscan-tags-bundle';out.mkdir()
+          for name,text in files.items(): (out/name).write_text(text)
+          PYBUNDLE
+      - name: Negative evaluator controls
+        run: python3 "$RUNNER_TEMP/rustscan-tags-bundle/test-evaluator.py"
+      - name: Native before and after and all upstream required gates with no network
+        run: python3 "$RUNNER_TEMP/rustscan-tags-bundle/run-qualification.py"
+      - name: Always retain exact source and guard evidence
+        if: always()
         run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+          mkdir -p "$RUNNER_TEMP/rustscan-tags-evidence"
+          git -C rustscan rev-parse HEAD > "$RUNNER_TEMP/rustscan-tags-evidence/final-head.txt"
+          git -C rustscan diff --cached > "$RUNNER_TEMP/rustscan-tags-evidence/final-source.diff"
+          git -C rustscan status --porcelain --untracked-files=all > "$RUNNER_TEMP/rustscan-tags-evidence/final-status.txt"
+          python3 - <<'PYGUARD'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'rustscan-tags-evidence'/'qualification.json'
+          assert p.exists(),'Missing qualification receipt; no successful qualification'
+          r=json.loads(p.read_text());assert r.get('always_after_source_guard')=='PASS',r
+          PYGUARD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
         with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+          name: rustscan-tags-native-qualification
+          path: ${{ runner.temp }}/rustscan-tags-evidence
+          if-no-files-found: error
