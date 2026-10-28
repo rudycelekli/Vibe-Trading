@@ -1,249 +1,141 @@
-name: CI
-
+name: Private Ciphey native qualification
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
   workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
+permissions:
+  contents: read
+concurrency:
+  group: ciphey-expansion-qualification-20261028
+  cancel-in-progress: false
 jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
+      - name: Set one shared bounded deadline and verify required namespace tools
+        shell: bash
         run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+          set -euo pipefail
+          echo "QUALIFICATION_DEADLINE=$(( $(date +%s) + 2400 ))" >> "$GITHUB_ENV"
+          command -v sudo
+          command -v unshare
+          command -v runuser
+          command -v rustup
+          sudo unshare --net -- runuser --user "$(id -un)" -- test "$(id -u)" -ne 0
+      - name: Checkout exact public upstream source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
+          repository: bee-san/Ciphey
+          ref: 867d27e8a5fe3dfa30ef6d322447fb85b9b43497
+          path: ciphey
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Python for exact upstream Codespell version
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Install exact upstream spelling dependency
+        shell: bash
         run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ciphey-qualification-setup"
+          python -m pip install codespell==2.4.1 2>&1 | tee "$RUNNER_TEMP/ciphey-qualification-setup/codespell-install.log"
+      - name: Install stable native toolchain, matching upstream CI
+        shell: bash
         run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          mkdir -p "$RUNNER_TEMP/ciphey-qualification-setup"
+          rustup run stable rustc -Vv | tee "$RUNNER_TEMP/ciphey-qualification-setup/toolchain.txt"
+          unshare --version | tee "$RUNNER_TEMP/ciphey-qualification-setup/unshare-version.txt"
+          runuser --version | tee "$RUNNER_TEMP/ciphey-qualification-setup/runuser-version.txt"
+      - name: Unpack exact allowlisted public source and maintained tests
+        shell: bash
         run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
+          python3 - <<'PYBUNDLE'
+          import base64, gzip, hashlib, json, os, pathlib
+          raw = gzip.decompress(base64.b64decode('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'))
+          assert hashlib.sha256(raw).hexdigest() == 'efd9352364e57029a0270e5b4184bddfcc886d7a56838c2001879b8da181c321'
+          files = json.loads(raw)
+          expected = {'manifest.json', 'run-qualification.py', 'test-evaluator.py', 'independent-oracles.py', 'qp-tests-only.patch', 'qp-candidate.patch', 'uu-tests-only.patch', 'uu-candidate.patch'}
+          assert set(files) == expected
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ciphey-qualification-bundle'
+          out.mkdir()
+          for name, text in files.items():
+              (out / name).write_text(text)
+          PYBUNDLE
+      - name: Negative controls for actual evaluator and source guards
+        shell: bash
         run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+          set -euo pipefail
+          python "$RUNNER_TEMP/ciphey-qualification-bundle/test-evaluator.py" > "$RUNNER_TEMP/ciphey-qualification-setup/evaluator-selftest.log" 2>&1
+      - name: Fetch locked crate dependencies only
+        shell: bash
+        working-directory: ciphey
+        run: |
+          set -euo pipefail
+          rustup run stable cargo fetch --locked 2>&1 | tee "$RUNNER_TEMP/ciphey-qualification-setup/cargo-fetch.log"
+      - name: Independent standards oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/ciphey-qualification-bundle/independent-oracles.py" > "$RUNNER_TEMP/ciphey-qualification-setup/independent-oracles.json"
+      - name: Quoted-Printable isolated native before and after, then all required gates
+        id: qp
+        shell: bash
+        run: python3 "$RUNNER_TEMP/ciphey-qualification-bundle/run-qualification.py" qp
+      - name: Uuencode isolated native before and after, then all required gates
+        if: ${{ !cancelled() && steps.qp.outcome != 'skipped' }}
+        shell: bash
+        run: python3 "$RUNNER_TEMP/ciphey-qualification-bundle/run-qualification.py" uu
+      - name: Always verify source, index, worktree and allowlists
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYGUARD'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'ciphey'
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ciphey-qualification-setup'
+          out.mkdir(exist_ok=True)
+          bundle = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ciphey-qualification-bundle'
+          report = {'guard_passed': False}
+          if not (root / '.git').exists() or not (bundle / 'manifest.json').exists():
+              report['state'] = 'setup incomplete, source qualification did not finish'
+              (out / 'always-after-source-guard.json').write_text(json.dumps(report, indent=2))
+              raise SystemExit(1)
+          def git(*args):
+              return subprocess.check_output(['git', '-C', str(root), *args], text=True).strip()
+          try:
+              manifest = json.loads((bundle / 'manifest.json').read_text())
+              base = manifest['qp']['candidate']
+              assert git('rev-parse', 'HEAD') == base['base']
+              tree = git('write-tree')
+              report.update(head=git('rev-parse', 'HEAD'), index_tree=tree)
+              expected = [value for phases in manifest.values() for value in phases.values() if value['tree'] == tree]
+              if tree == base['base_tree']:
+                  assert git('diff', '--cached', '--name-only') == ''
+              else:
+                  assert len(expected) == 1, 'unrecognized staged tree'
+                  value = expected[0]
+                  assert git('diff', '--cached', '--name-only') == value['file']
+                  assert hashlib.sha256((root / value['file']).read_bytes()).hexdigest() == value['postimage_sha256']
+              assert git('diff', '--name-only') == '', 'worktree drift'
+              assert git('ls-files', '--others', '--exclude-standard') == '', 'untracked source'
+              subprocess.run(['git', '-C', str(root), 'diff', '--cached', '--check'], check=True)
+              report['guard_passed'] = True
+          finally:
+              report['worktree_diff'] = git('diff', '--stat')
+              report['staged_paths'] = git('diff', '--cached', '--name-only')
+              (out / 'always-after-source-guard.json').write_text(json.dumps(report, indent=2))
+          PYGUARD
+      - name: Always preserve exact evidence and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+          name: ciphey-native-qualification-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ciphey-qualification-setup/
+            ${{ runner.temp }}/ciphey-qualification-qp/
+            ${{ runner.temp }}/ciphey-qualification-uu/
+            ${{ runner.temp }}/ciphey-qualification-bundle/
+          retention-days: 14
+          if-no-files-found: warn
