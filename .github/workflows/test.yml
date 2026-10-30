@@ -1,249 +1,286 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
-jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+{
+  "name": "Claude-mem Gemini resumed transcript migration full qualification",
+  "on": {
+    "push": {
+      "branches": [
+        "validation/additional20-gemini-migration-20261030"
+      ]
+    },
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read",
+    "actions": "read"
+  },
+  "concurrency": {
+    "group": "claude-mem-additional-gemini-migration-${{ github.ref }}",
+    "cancel-in-progress": false
+  },
+  "defaults": {
+    "run": {
+      "shell": "bash"
+    }
+  },
+  "jobs": {
+    "prepare": {
+      "name": "Immutable baseline \u00b7 exact regression oracle \u00b7 dependency freeze",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 45,
+      "steps": [
+        {
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "20.19.0"
+          }
+        },
+        {
+          "uses": "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "with": {
+            "bun-version": "1.4.2"
+          }
+        },
+        {
+          "name": "Fetch immutable public source and install proof driver",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nmkdir -p \"$TASK_DIR/evidence\" \"$TASK_DIR/input\"\ncat > \"$TASK_DIR/qualification.py\" <<'PY_QUALIFICATION'\nimport pathlib, subprocess, json, hashlib, base64, sys, os, tempfile, xml.etree.ElementTree as ET\nCFG = {'base': '325afb60108d4ab04e24d715f244bd591ca33fbe', 'tree': '01a9ac821ec32f2e84839da35e2102aac2ded6e0', 'patch_sha': '690a75513171b4f7b354b8972a1f37e8094152e101c5f803a38ec41702dea3b7', 'patch_b64': 'ZGlmZiAtLWdpdCBhL3NyYy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L3JlYWRlcnMudHMgYi9zcmMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9yZWFkZXJzLnRzCmluZGV4IGE0MmY5YmIuLjZkMTZhMTkgMTAwNjQ0Ci0tLSBhL3NyYy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L3JlYWRlcnMudHMKKysrIGIvc3JjL3NlcnZpY2VzL3Byb21wdC1pbXBvcnQvcmVhZGVycy50cwpAQCAtMzQ4LDYgKzM0OCw3IEBAIGZ1bmN0aW9uIGdlbWluaVR5cGVkVGV4dChtZXNzYWdlOiBhbnkpOiBzdHJpbmcgfCBudWxsIHsKIAogZXhwb3J0IGZ1bmN0aW9uIGNyZWF0ZUdlbWluaUNsaVJlYWRlcigpOiBBZ2VudFByb21wdFJlYWRlciB7CiAgIGxldCBwcm9qZWN0RGlyZWN0b3JpZXMgPSBuZXcgTWFwPHN0cmluZywgc3RyaW5nPigpOworICBjb25zdCBzZWVuUHJvbXB0cyA9IG5ldyBTZXQ8c3RyaW5nPigpOwogICByZXR1cm4gewogICAgIGlkOiAnZ2VtaW5pLWNsaScsCiAgICAgbGFiZWw6ICdHZW1pbmkgQ0xJJywKQEAgLTM3NSwxMCArMzc2LDE0IEBAIGV4cG9ydCBmdW5jdGlvbiBjcmVhdGVHZW1pbmlDbGlSZWFkZXIoKTogQWdlbnRQcm9tcHRSZWFkZXIgewogICAgICAgICBjb25zdCB0ZXh0ID0gZ2VtaW5pVHlwZWRUZXh0KG1lc3NhZ2UpOwogICAgICAgICBjb25zdCBhdCA9IGlzb1RvRXBvY2hNcyhtZXNzYWdlLnRpbWVzdGFtcCk7CiAgICAgICAgIGlmICh0ZXh0ID09PSBudWxsIHx8IGF0ID09PSBudWxsIHx8IGF0IDwgc2luY2VFcG9jaE1zKSBjb250aW51ZTsKKyAgICAgICAgY29uc3QgbmF0aXZlUHJvbXB0SWQgPSB0eXBlb2YgbWVzc2FnZS5pZCA9PT0gJ3N0cmluZycgJiYgbWVzc2FnZS5pZCA/IG1lc3NhZ2UuaWQgOiBmYWxsYmFja0lkKHNlc3Npb25JZCwgbWVzc2FnZS50aW1lc3RhbXAsIHRleHQpOworICAgICAgICBjb25zdCBpZGVudGl0eSA9IGZhbGxiYWNrSWQoc2Vzc2lvbklkLCBuYXRpdmVQcm9tcHRJZCwgU3RyaW5nKGF0KSwgdGV4dCk7CisgICAgICAgIGlmIChzZWVuUHJvbXB0cy5oYXMoaWRlbnRpdHkpKSBjb250aW51ZTsKKyAgICAgICAgc2VlblByb21wdHMuYWRkKGlkZW50aXR5KTsKICAgICAgICAgc2luay5wcm9tcHQoewogICAgICAgICAgIGFnZW50OiAnZ2VtaW5pLWNsaScsCiAgICAgICAgICAgc2Vzc2lvbklkLAotICAgICAgICAgIG5hdGl2ZVByb21wdElkOiB0eXBlb2YgbWVzc2FnZS5pZCA9PT0gJ3N0cmluZycgJiYgbWVzc2FnZS5pZCA/IG1lc3NhZ2UuaWQgOiBmYWxsYmFja0lkKHNlc3Npb25JZCwgbWVzc2FnZS50aW1lc3RhbXAsIHRleHQpLAorICAgICAgICAgIG5hdGl2ZVByb21wdElkLAogICAgICAgICAgIGF0LAogICAgICAgICAgIGN3ZDogcHJvamVjdERpcmVjdG9yaWVzLmdldChwcm9qZWN0TmFtZSkgPz8gbnVsbCwKICAgICAgICAgICB0ZXh0LApkaWZmIC0tZ2l0IGEvdGVzdHMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9nZW1pbmktbWlncmF0aW9uLnRlc3QudHMgYi90ZXN0cy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L2dlbWluaS1taWdyYXRpb24udGVzdC50cwpuZXcgZmlsZSBtb2RlIDEwMDY0NAppbmRleCAwMDAwMDAwLi5lZGY5Mzc3Ci0tLSAvZGV2L251bGwKKysrIGIvdGVzdHMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9nZW1pbmktbWlncmF0aW9uLnRlc3QudHMKQEAgLTAsMCArMSw0MCBAQAoraW1wb3J0IHsgZXhwZWN0LCBpdCB9IGZyb20gJ2J1bjp0ZXN0JzsKK2ltcG9ydCB7IG1rZGlyU3luYywgbWtkdGVtcFN5bmMsIHJtU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gJ2ZzJzsKK2ltcG9ydCB7IHRtcGRpciB9IGZyb20gJ29zJzsKK2ltcG9ydCB7IGpvaW4gfSBmcm9tICdwYXRoJzsKK2ltcG9ydCB7IHNjYW5Pd25lclByb21wdHMgfSBmcm9tICcuLi8uLi8uLi9zcmMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9pbmRleC5qcyc7CisKK2ZvciAoY29uc3Qgd2l0aElkcyBvZiBbdHJ1ZSwgZmFsc2VdKSB7CisgIGl0KGBpbXBvcnRzIGVhY2ggR2VtaW5pIHByb21wdCBvbmNlIHdoZW4gYSByZXN1bWVkIEpTT04gc2Vzc2lvbiBhbHNvIGhhcyBhIEpTT05MIGNvcHkgKCR7d2l0aElkcyA/ICduYXRpdmUgaWRzJyA6ICdsZWdhY3kgaWRzJ30pYCwgYXN5bmMgKCkgPT4geworICAgIGNvbnN0IGhvbWUgPSBta2R0ZW1wU3luYyhqb2luKHRtcGRpcigpLCAnZ2VtaW5pLW1pZ3JhdGlvbi0nKSk7CisgICAgdHJ5IHsKKyAgICAgIGNvbnN0IGNoYXRzID0gam9pbihob21lLCAnLmdlbWluaScsICd0bXAnLCAnZXhhbXBsZScsICdjaGF0cycpOworICAgICAgbWtkaXJTeW5jKGNoYXRzLCB7IHJlY3Vyc2l2ZTogdHJ1ZSB9KTsKKyAgICAgIGNvbnN0IGhlYWRlciA9IHsgc2Vzc2lvbklkOiAncmVzdW1lZC1zZXNzaW9uJywga2luZDogJ21haW4nIH07CisgICAgICBjb25zdCBmaXJzdCA9IHsgLi4uKHdpdGhJZHMgPyB7IGlkOiAnZmlyc3QnIH0gOiB7fSksIHR5cGU6ICd1c2VyJywgdGltZXN0YW1wOiAnMjAyNi0wOS0xNlQwMDowMDowMFonLCBjb250ZW50OiAnZXhwbGFpbiB0aGUgb3JpZ2luYWwgYmVoYXZpb3InIH07CisgICAgICBjb25zdCBuZXh0ID0geyAuLi4od2l0aElkcyA/IHsgaWQ6ICduZXh0JyB9IDoge30pLCB0eXBlOiAndXNlcicsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDE6MDBaJywgY29udGVudDogJ2NvbnRpbnVlIGluIHRoZSByZXN1bWVkIHNlc3Npb24nIH07CisgICAgICB3cml0ZUZpbGVTeW5jKGpvaW4oY2hhdHMsICdzZXNzaW9uLXJlc3VtZWQuanNvbicpLCBKU09OLnN0cmluZ2lmeSh7IC4uLmhlYWRlciwgbWVzc2FnZXM6IFtmaXJzdF0gfSkpOworICAgICAgd3JpdGVGaWxlU3luYyhqb2luKGNoYXRzLCAnc2Vzc2lvbi1yZXN1bWVkLmpzb25sJyksIFtoZWFkZXIsIGZpcnN0LCBuZXh0XS5tYXAocmVjb3JkID0+IEpTT04uc3RyaW5naWZ5KHJlY29yZCkpLmpvaW4oJ1xuJykpOworICAgICAgY29uc3QgcmVzdWx0ID0gYXdhaXQgc2Nhbk93bmVyUHJvbXB0cyh7IHNpbmNlRXBvY2hNczogMCwgaG9tZURpcmVjdG9yeTogaG9tZSwgcmVzb2x2ZVByb2plY3Q6ICgpID0+ICdleGFtcGxlJyB9KTsKKyAgICAgIGV4cGVjdChyZXN1bHQub3duZXJQcm9tcHRzLm1hcChwcm9tcHQgPT4gcHJvbXB0LnRleHQpKS50b0VxdWFsKFsnZXhwbGFpbiB0aGUgb3JpZ2luYWwgYmVoYXZpb3InLCAnY29udGludWUgaW4gdGhlIHJlc3VtZWQgc2Vzc2lvbiddKTsKKyAgICAgIGV4cGVjdChyZXN1bHQuYWdlbnRzLmZpbmQoYWdlbnQgPT4gYWdlbnQuaWQgPT09ICdnZW1pbmktY2xpJykhLnR5cGVkKS50b0JlKDIpOworICAgIH0gZmluYWxseSB7IHJtU3luYyhob21lLCB7IHJlY3Vyc2l2ZTogdHJ1ZSwgZm9yY2U6IHRydWUgfSk7IH0KKyAgfSk7Cit9CisKK2l0KCdrZWVwcyBkaXN0aW5jdCBHZW1pbmkgdHVybnMgYW5kIGEgY2hhbmdlZCByZXZpc2lvbiByYXRoZXIgdGhhbiBkZWR1cGxpY2F0aW5nIG9ubHkgYnkgdGV4dCBvciBpZCcsIGFzeW5jICgpID0+IHsKKyAgY29uc3QgaG9tZSA9IG1rZHRlbXBTeW5jKGpvaW4odG1wZGlyKCksICdnZW1pbmktZGlzdGluY3QtdHVybnMtJykpOworICB0cnkgeworICAgIGNvbnN0IGNoYXRzID0gam9pbihob21lLCAnLmdlbWluaScsICd0bXAnLCAnZXhhbXBsZScsICdjaGF0cycpOworICAgIG1rZGlyU3luYyhjaGF0cywgeyByZWN1cnNpdmU6IHRydWUgfSk7CisgICAgY29uc3QgaGVhZGVyID0geyBzZXNzaW9uSWQ6ICdkaXN0aW5jdC1zZXNzaW9uJywga2luZDogJ21haW4nIH07CisgICAgY29uc3Qgb3JpZ2luYWwgPSB7IGlkOiAnZmlyc3QnLCB0eXBlOiAndXNlcicsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDA6MDBaJywgY29udGVudDogJ2NvbnRpbnVlJyB9OworICAgIGNvbnN0IHJldmlzaW9uID0geyAuLi5vcmlnaW5hbCwgY29udGVudDogJ2NvbnRpbnVlIHdpdGggdGhlIGNvcnJlY3RlZCBpbnN0cnVjdGlvbnMnIH07CisgICAgY29uc3QgcmVwZWF0ZWQgPSB7IC4uLm9yaWdpbmFsLCBpZDogJ3NlY29uZCcsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDI6MDBaJyB9OworICAgIHdyaXRlRmlsZVN5bmMoam9pbihjaGF0cywgJ3Nlc3Npb24tZGlzdGluY3QuanNvbicpLCBKU09OLnN0cmluZ2lmeSh7IC4uLmhlYWRlciwgbWVzc2FnZXM6IFtvcmlnaW5hbF0gfSkpOworICAgIHdyaXRlRmlsZVN5bmMoam9pbihjaGF0cywgJ3Nlc3Npb24tZGlzdGluY3QuanNvbmwnKSwgW2hlYWRlciwgcmV2aXNpb24sIHJlcGVhdGVkXS5tYXAocmVjb3JkID0+IEpTT04uc3RyaW5naWZ5KHJlY29yZCkpLmpvaW4oJ1xuJykpOworICAgIGNvbnN0IHJlc3VsdCA9IGF3YWl0IHNjYW5Pd25lclByb21wdHMoeyBzaW5jZUVwb2NoTXM6IDAsIGhvbWVEaXJlY3Rvcnk6IGhvbWUsIHJlc29sdmVQcm9qZWN0OiAoKSA9PiAnZXhhbXBsZScgfSk7CisgICAgZXhwZWN0KHJlc3VsdC5vd25lclByb21wdHMubWFwKHByb21wdCA9PiBwcm9tcHQudGV4dCkuc29ydCgpKS50b0VxdWFsKFsnY29udGludWUnLCAnY29udGludWUnLCAnY29udGludWUgd2l0aCB0aGUgY29ycmVjdGVkIGluc3RydWN0aW9ucyddKTsKKyAgICBleHBlY3QocmVzdWx0LmFnZW50cy5maW5kKGFnZW50ID0+IGFnZW50LmlkID09PSAnZ2VtaW5pLWNsaScpIS50eXBlZCkudG9CZSgzKTsKKyAgfSBmaW5hbGx5IHsgcm1TeW5jKGhvbWUsIHsgcmVjdXJzaXZlOiB0cnVlLCBmb3JjZTogdHJ1ZSB9KTsgfQorfSk7Cg==', 'file_hashes': {'src/services/prompt-import/readers.ts': '34dab7194346e227dc3200b92fd163204f2531bf237a5e6fdb5dccd6072a7a0d', 'tests/services/prompt-import/gemini-migration.test.ts': 'ff1323b4a70106d5921695a63ed4bb3f2daf339a2886449505580bc8a17c8e5a'}, 'baseline_helper': '5da84d104290ff0f2af8b2ae5510a615d1bf95a3db2037ebb7c4238d51b866c9', 'all_names': ['imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (legacy ids)', 'imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (native ids)', 'keeps distinct Gemini turns and a changed revision rather than deduplicating only by text or id'], 'fail_names': ['imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (legacy ids)', 'imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (native ids)'], 'production_path': 'src/services/prompt-import/readers.ts', 'test_path': 'tests/services/prompt-import/gemini-migration.test.ts', 'consumer_files': ['tests/services/prompt-import/readers.test.ts', 'tests/services/prompt-import/setup-scan.test.ts', 'tests/services/prompt-import/token-usage.test.ts']}\nTASK = pathlib.Path(os.environ['RUNNER_TEMP']) / 'claude-mem-qualification'\nSRC = TASK / 'source'\nEVIDENCE = TASK / 'evidence'\nINPUT = TASK / 'input'\nEVIDENCE.mkdir(parents=True, exist_ok=True)\nINPUT.mkdir(parents=True, exist_ok=True)\nOWNED = set(CFG['file_hashes'])\nGENERATED_PREFIXES = ('plugin/scripts/', 'plugin/sqlite/', 'plugin/ui/')\nGENERATED_FILES = {\n 'plugin/skills/request-progress/scripts/request-groups.mjs',\n 'plugin/package.json','plugin/bun.lock','dsh/package.json',\n '.codex-plugin/plugin.json','plugin/.codex-plugin/plugin.json',\n '.qoder-plugin/plugin.json','plugin/.qoder-plugin/plugin.json',\n '.claude-plugin/plugin.json','plugin/.claude-plugin/plugin.json',\n '.claude-plugin/marketplace.json','.grok-plugin/plugin.json',\n 'openclaw/openclaw.plugin.json',\n 'claude-mem-cursor/.cursor-plugin/plugin.json',\n 'claude-mem-grok-bot/.cursor-plugin/plugin.json',\n 'plugin/skills/how-it-works/onboarding-explainer.md',\n}\ndef sha(p):\n return hashlib.sha256(p.read_bytes()).hexdigest()\ndef call(args, **kwargs):\n return subprocess.run(args, cwd=SRC, check=True, capture_output=True, text=True, **kwargs).stdout.strip()\ndef write(name, value):\n (EVIDENCE/name).write_text(json.dumps(value,indent=2)+'\\n')\ndef generated(name):\n return name in GENERATED_FILES or name.startswith(GENERATED_PREFIXES)\ndef tracked():\n names=call(['git','ls-files','-z']).split('\\0')\n result={}\n for name in names:\n  if not name: continue\n  p=SRC/name\n  result[name]=hashlib.sha256(os.readlink(p).encode()).hexdigest() if p.is_symlink() else sha(p)\n return result\ndef tree():\n with tempfile.TemporaryDirectory(prefix='index-',dir=TASK) as td:\n  env=dict(os.environ,GIT_INDEX_FILE=str(pathlib.Path(td)/'index'))\n  call(['git','read-tree','HEAD'],env=env)\n  call(['git','add','--',*sorted(OWNED)],env=env)\n  return call(['git','write-tree'],env=env)\ndef assert_base():\n assert call(['git','rev-parse','HEAD'])==CFG['base'], 'immutable source HEAD changed'\ndef initialize():\n assert_base()\n assert not call(['git','status','--porcelain','--untracked-files=no']), 'base must be tracked-clean'\n assert not (SRC/'package-lock.json').exists(), 'repo intentionally has no root lockfile'\n assert sha(SRC/'src/services/prompt-import/readers.ts')==CFG['baseline_helper']\n data=base64.b64decode(CFG['patch_b64'],validate=True)\n assert hashlib.sha256(data).hexdigest()==CFG['patch_sha']\n (INPUT/'candidate.patch').write_bytes(data)\n chunks=[b'diff --git '+x for x in data.split(b'diff --git ')[1:]]\n assert len(chunks)==2\n expected={\n  b'diff --git a/src/services/prompt-import/readers.ts b/src/services/prompt-import/readers.ts':'production.patch',\n  b'diff --git a/tests/services/prompt-import/gemini-migration.test.ts b/tests/services/prompt-import/gemini-migration.test.ts':'tests.patch',\n }\n for chunk in chunks:\n  first=chunk.splitlines()[0]\n  assert first in expected, first\n  (INPUT/expected[first]).write_bytes(chunk)\n write('base-tracked.json',tracked())\n write('input-provenance.json',{'base':CFG['base'],'candidate_tree':CFG['tree'],'patch_sha256':CFG['patch_sha'],'patch_parts':{p.name:sha(p) for p in INPUT.glob('*.patch')}})\ndef install_guard():\n assert_base()\n before=json.loads((EVIDENCE/'base-tracked.json').read_text())\n assert tracked()==before, 'dependency installation changed tracked source'\ndef check_junit(path, mode):\n doc=ET.parse(path)\n cases=list(doc.iter('testcase'))\n failures=[c for c in cases if c.find('failure') is not None]\n errors=[c for c in cases if c.find('error') is not None]\n skips=[c for c in cases if c.find('skipped') is not None]\n expected=30 if mode=='consumers' else 3\n assert len(cases)==expected, (len(cases),expected)\n assert not errors and not skips, 'native proof cannot be an error or skip'\n if mode=='before':\n  assert sorted(c.attrib['name'] for c in cases)==CFG['all_names']\n  assert sorted(c.attrib['name'] for c in failures)==CFG['fail_names']\n  assert all(c.find('failure').attrib.get('type')=='AssertionError' for c in failures)\n  assert len(cases)-len(failures)==1\n else:\n  assert not failures\n  if mode=='after': assert sorted(c.attrib['name'] for c in cases)==CFG['all_names']\n result={'mode':mode,'tests':len(cases),'passed':len(cases)-len(failures),'failed_names':[c.attrib['name'] for c in failures],'errors':len(errors),'skipped':len(skips)}\n write('native-'+mode+'-oracle.json',result)\n print(json.dumps(result))\ndef native(mode):\n files=['tests/services/prompt-import/gemini-migration.test.ts']\n if mode=='consumers': files += CFG['consumer_files']\n xml=EVIDENCE/('native-'+mode+'.xml')\n cmd=['bun','test',*files,'--reporter=junit','--reporter-outfile='+str(xml)]\n with (EVIDENCE/('native-'+mode+'.log')).open('w') as log:\n  r=subprocess.run(cmd,cwd=SRC,stdout=log,stderr=subprocess.STDOUT)\n assert r.returncode==(1 if mode=='before' else 0), ('unexpected native exit',mode,r.returncode)\n check_junit(xml,mode)\ndef baseline():\n install_guard()\n call(['git','apply','--check',str(INPUT/'tests.patch')])\n call(['git','apply',str(INPUT/'tests.patch')])\n call(['git','add','-N','--',CFG['test_path']])\n assert sha(SRC/'src/services/prompt-import/readers.ts')==CFG['baseline_helper']\n assert sha(SRC/'tests/services/prompt-import/gemini-migration.test.ts')==CFG['file_hashes']['tests/services/prompt-import/gemini-migration.test.ts']\n assert set(call(['git','diff','--name-only']).splitlines())=={'tests/services/prompt-import/gemini-migration.test.ts'}\n native('before')\ndef apply_candidate(full=False):\n assert_base()\n part='candidate.patch' if full else 'production.patch'\n call(['git','apply','--check',str(INPUT/part)])\n call(['git','apply',str(INPUT/part)])\n call(['git','add','-N','--',CFG['test_path']])\n assert set(call(['git','diff','--name-only']).splitlines())==OWNED\n for name,digest in CFG['file_hashes'].items(): assert sha(SRC/name)==digest,name\n assert tree()==CFG['tree'], 'candidate working tree does not match reviewed tree'\n call(['git','diff','--check'])\n write('candidate-source-guard.json',{'base':CFG['base'],'tree':tree(),'files':CFG['file_hashes'],'patch_sha256':CFG['patch_sha']})\n write('candidate-tracked.json',tracked())\ndef record_resolution():\n install_guard()\n lock=SRC/'package-lock.json'\n assert lock.exists()\n (INPUT/'package-lock.json').write_bytes(lock.read_bytes())\n record={'root_lock_provenance':'resolved once by npm from immutable public base; not a committed repository lock','sha256':sha(lock),'node':call(['node','--version']),'npm':call(['npm','--version']),'bun':call(['bun','--version']),'bun_binary_sha256':sha(pathlib.Path(call(['which','bun'])).resolve()),'package_json_sha256':sha(SRC/'package.json'),'plugin_lock_sha256':sha(SRC/'plugin/bun.lock')}\n (INPUT/'dependency-resolution.json').write_text(json.dumps(record,indent=2)+'\\n')\n write('dependency-resolution.json',record)\n with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('lock_sha='+record['sha256']+'\\n')\ndef use_resolution():\n record=json.loads((INPUT/'dependency-resolution.json').read_text())\n expected=os.environ['EXPECTED_LOCK_SHA']\n assert len(expected)==64 and all(c in '0123456789abcdef' for c in expected)\n assert record['sha256']==expected==sha(INPUT/'package-lock.json')\n assert sha(INPUT/'candidate.patch')==CFG['patch_sha'], 'downloaded patch changed'\n assert record['bun_binary_sha256']==sha(pathlib.Path(call(['which','bun'])).resolve()), 'Bun binary differs across jobs'\n assert record['package_json_sha256']==sha(SRC/'package.json')\n assert record['node']==call(['node','--version']) and record['bun']==call(['bun','--version'])\n (SRC/'package-lock.json').write_bytes((INPUT/'package-lock.json').read_bytes())\n write('downloaded-resolution-verified.json',record)\ndef protected_guard():\n assert_base()\n expected=json.loads((EVIDENCE/'candidate-tracked.json').read_text())\n actual=tracked()\n changes={name:{'before':digest,'after':actual.get(name)} for name,digest in expected.items() if actual.get(name)!=digest}\n forbidden=[name for name in changes if not generated(name)]\n write('generated-build-changes.json',{'generated_changes':changes,'forbidden_source_changes':forbidden,'note':'generated output is evidence only; never staged or published by this workflow'})\n assert not forbidden, forbidden\n for name,digest in CFG['file_hashes'].items(): assert sha(SRC/name)==digest,name\n sizes={}\n for name,budget in [('worker-service.cjs',2900*1024),('mcp-server.cjs',600*1024),('transcript-watcher.cjs',200*1024)]:\n  p=SRC/'plugin/scripts'/name\n  if p.exists(): sizes[name]={'bytes':p.stat().st_size,'sha256':sha(p),'advisory_budget_bytes':budget,'over_advisory':p.stat().st_size>budget}\n write('bundle-observations.json',{'bundles':sizes,'budgets_are_advisory_in_upstream_source':True,'hard_integrity_checks':'npm run build enforces bundle parse, absolute-path, external-Zod and distribution assertions; warnings are not hard size gates'})\n write('final-source-guard.json',{'base':CFG['base'],'reviewed_candidate_tree_before_build':CFG['tree'],'protected_source_unchanged':True})\ndef selftest():\n check_junit(pathlib.Path(sys.argv[2]),sys.argv[3])\nif __name__=='__main__':\n commands={'initialize':initialize,'install-guard':install_guard,'baseline':baseline,'apply-candidate':apply_candidate,'apply-full-candidate':lambda:apply_candidate(True),'native-after':lambda:native('after'),'native-consumers':lambda:native('consumers'),'record-resolution':record_resolution,'use-resolution':use_resolution,'protected-guard':protected_guard,'oracle-selftest':selftest}\n commands[sys.argv[1]]()\nPY_QUALIFICATION\n\ngit init \"$TASK_DIR/source\"\ngit -C \"$TASK_DIR/source\" remote add origin https://github.com/thedotmack/claude-mem.git\ngit -C \"$TASK_DIR/source\" fetch --no-tags --depth=1 origin 325afb60108d4ab04e24d715f244bd591ca33fbe\ngit -C \"$TASK_DIR/source\" checkout --detach FETCH_HEAD\ngit -C \"$TASK_DIR/source\" update-ref refs/remotes/origin/main 325afb60108d4ab04e24d715f244bd591ca33fbe\nset -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\ntest \"$(node --version)\" = \"v20.19.0\"\ntest \"$(bun --version)\" = \"1.4.2\"\npython3 \"$TASK_DIR/qualification.py\" initialize\n"
+        },
+        {
+          "name": "Download verified dependency-resolution snapshot",
+          "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+          "with": {
+            "name": "claude-mem-marker-inputs",
+            "path": "${{ runner.temp }}/claude-mem-qualification/resolution-download",
+            "run-id": 41013383947,
+            "github-token": "${{ github.token }}"
+          }
+        },
+        {
+          "name": "Import only verified dependency resolution without overwriting new patches",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\ncp \"$TASK_DIR/resolution-download/package-lock.json\" \"$TASK_DIR/input/package-lock.json\"\ncp \"$TASK_DIR/resolution-download/dependency-resolution.json\" \"$TASK_DIR/input/dependency-resolution.json\"\n"
+        },
+        {
+          "name": "Verify previous resolution and frozen install for new repair source",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\npython3 \"$TASK_DIR/qualification.py\" use-resolution\nnpm ci --no-audit --no-fund > \"$EVIDENCE_DIR/root-frozen-install.log\" 2>&1\npython3 \"$TASK_DIR/qualification.py\" install-guard\n",
+          "timeout-minutes": 20,
+          "env": {
+            "EXPECTED_LOCK_SHA": "4fbc66f858ab6c473156741de4aab6413548c7d7651ab2be510e35c4a0abef1b"
+          }
+        },
+        {
+          "name": "Verify committed plugin lock before any build",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nsha256sum plugin/package.json plugin/bun.lock > \"$EVIDENCE_DIR/plugin-pair-before.sha256\"\n(cd plugin && bun install --frozen-lockfile --ignore-scripts) > \"$EVIDENCE_DIR/plugin-frozen-install.log\" 2>&1\nsha256sum -c \"$EVIDENCE_DIR/plugin-pair-before.sha256\"\npython3 \"$TASK_DIR/qualification.py\" install-guard\n",
+          "timeout-minutes": 12
+        },
+        {
+          "name": "Require exact native baseline 1 pass 2 assertion failures then 3 fixed and 30 consumer passes",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\npython3 \"$TASK_DIR/qualification.py\" baseline\npython3 \"$TASK_DIR/qualification.py\" apply-candidate\npython3 \"$TASK_DIR/qualification.py\" native-after\npython3 \"$TASK_DIR/qualification.py\" native-consumers\n",
+          "id": "admit",
+          "timeout-minutes": 5
+        },
+        {
+          "name": "Retain bounded proof logs and guards",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "claude-mem-gemini-migration-prepare",
+            "path": "${{ runner.temp }}/claude-mem-qualification/evidence",
+            "if-no-files-found": "warn",
+            "retention-days": 7
+          }
+        }
+      ],
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/additional20-gemini-migration-20261030' }}"
+    },
+    "core": {
+      "name": "Core upstream Linux gates \u00b7 full lanes \u00b7 source guards",
+      "needs": [
+        "prepare"
+      ],
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 45,
+      "steps": [
+        {
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "20.19.0"
+          }
+        },
+        {
+          "uses": "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "with": {
+            "bun-version": "1.4.2"
+          }
+        },
+        {
+          "name": "Fetch immutable public source and install proof driver",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nmkdir -p \"$TASK_DIR/evidence\" \"$TASK_DIR/input\"\ncat > \"$TASK_DIR/qualification.py\" <<'PY_QUALIFICATION'\nimport pathlib, subprocess, json, hashlib, base64, sys, os, tempfile, xml.etree.ElementTree as ET\nCFG = {'base': '325afb60108d4ab04e24d715f244bd591ca33fbe', 'tree': '01a9ac821ec32f2e84839da35e2102aac2ded6e0', 'patch_sha': '690a75513171b4f7b354b8972a1f37e8094152e101c5f803a38ec41702dea3b7', 'patch_b64': 'ZGlmZiAtLWdpdCBhL3NyYy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L3JlYWRlcnMudHMgYi9zcmMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9yZWFkZXJzLnRzCmluZGV4IGE0MmY5YmIuLjZkMTZhMTkgMTAwNjQ0Ci0tLSBhL3NyYy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L3JlYWRlcnMudHMKKysrIGIvc3JjL3NlcnZpY2VzL3Byb21wdC1pbXBvcnQvcmVhZGVycy50cwpAQCAtMzQ4LDYgKzM0OCw3IEBAIGZ1bmN0aW9uIGdlbWluaVR5cGVkVGV4dChtZXNzYWdlOiBhbnkpOiBzdHJpbmcgfCBudWxsIHsKIAogZXhwb3J0IGZ1bmN0aW9uIGNyZWF0ZUdlbWluaUNsaVJlYWRlcigpOiBBZ2VudFByb21wdFJlYWRlciB7CiAgIGxldCBwcm9qZWN0RGlyZWN0b3JpZXMgPSBuZXcgTWFwPHN0cmluZywgc3RyaW5nPigpOworICBjb25zdCBzZWVuUHJvbXB0cyA9IG5ldyBTZXQ8c3RyaW5nPigpOwogICByZXR1cm4gewogICAgIGlkOiAnZ2VtaW5pLWNsaScsCiAgICAgbGFiZWw6ICdHZW1pbmkgQ0xJJywKQEAgLTM3NSwxMCArMzc2LDE0IEBAIGV4cG9ydCBmdW5jdGlvbiBjcmVhdGVHZW1pbmlDbGlSZWFkZXIoKTogQWdlbnRQcm9tcHRSZWFkZXIgewogICAgICAgICBjb25zdCB0ZXh0ID0gZ2VtaW5pVHlwZWRUZXh0KG1lc3NhZ2UpOwogICAgICAgICBjb25zdCBhdCA9IGlzb1RvRXBvY2hNcyhtZXNzYWdlLnRpbWVzdGFtcCk7CiAgICAgICAgIGlmICh0ZXh0ID09PSBudWxsIHx8IGF0ID09PSBudWxsIHx8IGF0IDwgc2luY2VFcG9jaE1zKSBjb250aW51ZTsKKyAgICAgICAgY29uc3QgbmF0aXZlUHJvbXB0SWQgPSB0eXBlb2YgbWVzc2FnZS5pZCA9PT0gJ3N0cmluZycgJiYgbWVzc2FnZS5pZCA/IG1lc3NhZ2UuaWQgOiBmYWxsYmFja0lkKHNlc3Npb25JZCwgbWVzc2FnZS50aW1lc3RhbXAsIHRleHQpOworICAgICAgICBjb25zdCBpZGVudGl0eSA9IGZhbGxiYWNrSWQoc2Vzc2lvbklkLCBuYXRpdmVQcm9tcHRJZCwgU3RyaW5nKGF0KSwgdGV4dCk7CisgICAgICAgIGlmIChzZWVuUHJvbXB0cy5oYXMoaWRlbnRpdHkpKSBjb250aW51ZTsKKyAgICAgICAgc2VlblByb21wdHMuYWRkKGlkZW50aXR5KTsKICAgICAgICAgc2luay5wcm9tcHQoewogICAgICAgICAgIGFnZW50OiAnZ2VtaW5pLWNsaScsCiAgICAgICAgICAgc2Vzc2lvbklkLAotICAgICAgICAgIG5hdGl2ZVByb21wdElkOiB0eXBlb2YgbWVzc2FnZS5pZCA9PT0gJ3N0cmluZycgJiYgbWVzc2FnZS5pZCA/IG1lc3NhZ2UuaWQgOiBmYWxsYmFja0lkKHNlc3Npb25JZCwgbWVzc2FnZS50aW1lc3RhbXAsIHRleHQpLAorICAgICAgICAgIG5hdGl2ZVByb21wdElkLAogICAgICAgICAgIGF0LAogICAgICAgICAgIGN3ZDogcHJvamVjdERpcmVjdG9yaWVzLmdldChwcm9qZWN0TmFtZSkgPz8gbnVsbCwKICAgICAgICAgICB0ZXh0LApkaWZmIC0tZ2l0IGEvdGVzdHMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9nZW1pbmktbWlncmF0aW9uLnRlc3QudHMgYi90ZXN0cy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L2dlbWluaS1taWdyYXRpb24udGVzdC50cwpuZXcgZmlsZSBtb2RlIDEwMDY0NAppbmRleCAwMDAwMDAwLi5lZGY5Mzc3Ci0tLSAvZGV2L251bGwKKysrIGIvdGVzdHMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9nZW1pbmktbWlncmF0aW9uLnRlc3QudHMKQEAgLTAsMCArMSw0MCBAQAoraW1wb3J0IHsgZXhwZWN0LCBpdCB9IGZyb20gJ2J1bjp0ZXN0JzsKK2ltcG9ydCB7IG1rZGlyU3luYywgbWtkdGVtcFN5bmMsIHJtU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gJ2ZzJzsKK2ltcG9ydCB7IHRtcGRpciB9IGZyb20gJ29zJzsKK2ltcG9ydCB7IGpvaW4gfSBmcm9tICdwYXRoJzsKK2ltcG9ydCB7IHNjYW5Pd25lclByb21wdHMgfSBmcm9tICcuLi8uLi8uLi9zcmMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9pbmRleC5qcyc7CisKK2ZvciAoY29uc3Qgd2l0aElkcyBvZiBbdHJ1ZSwgZmFsc2VdKSB7CisgIGl0KGBpbXBvcnRzIGVhY2ggR2VtaW5pIHByb21wdCBvbmNlIHdoZW4gYSByZXN1bWVkIEpTT04gc2Vzc2lvbiBhbHNvIGhhcyBhIEpTT05MIGNvcHkgKCR7d2l0aElkcyA/ICduYXRpdmUgaWRzJyA6ICdsZWdhY3kgaWRzJ30pYCwgYXN5bmMgKCkgPT4geworICAgIGNvbnN0IGhvbWUgPSBta2R0ZW1wU3luYyhqb2luKHRtcGRpcigpLCAnZ2VtaW5pLW1pZ3JhdGlvbi0nKSk7CisgICAgdHJ5IHsKKyAgICAgIGNvbnN0IGNoYXRzID0gam9pbihob21lLCAnLmdlbWluaScsICd0bXAnLCAnZXhhbXBsZScsICdjaGF0cycpOworICAgICAgbWtkaXJTeW5jKGNoYXRzLCB7IHJlY3Vyc2l2ZTogdHJ1ZSB9KTsKKyAgICAgIGNvbnN0IGhlYWRlciA9IHsgc2Vzc2lvbklkOiAncmVzdW1lZC1zZXNzaW9uJywga2luZDogJ21haW4nIH07CisgICAgICBjb25zdCBmaXJzdCA9IHsgLi4uKHdpdGhJZHMgPyB7IGlkOiAnZmlyc3QnIH0gOiB7fSksIHR5cGU6ICd1c2VyJywgdGltZXN0YW1wOiAnMjAyNi0wOS0xNlQwMDowMDowMFonLCBjb250ZW50OiAnZXhwbGFpbiB0aGUgb3JpZ2luYWwgYmVoYXZpb3InIH07CisgICAgICBjb25zdCBuZXh0ID0geyAuLi4od2l0aElkcyA/IHsgaWQ6ICduZXh0JyB9IDoge30pLCB0eXBlOiAndXNlcicsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDE6MDBaJywgY29udGVudDogJ2NvbnRpbnVlIGluIHRoZSByZXN1bWVkIHNlc3Npb24nIH07CisgICAgICB3cml0ZUZpbGVTeW5jKGpvaW4oY2hhdHMsICdzZXNzaW9uLXJlc3VtZWQuanNvbicpLCBKU09OLnN0cmluZ2lmeSh7IC4uLmhlYWRlciwgbWVzc2FnZXM6IFtmaXJzdF0gfSkpOworICAgICAgd3JpdGVGaWxlU3luYyhqb2luKGNoYXRzLCAnc2Vzc2lvbi1yZXN1bWVkLmpzb25sJyksIFtoZWFkZXIsIGZpcnN0LCBuZXh0XS5tYXAocmVjb3JkID0+IEpTT04uc3RyaW5naWZ5KHJlY29yZCkpLmpvaW4oJ1xuJykpOworICAgICAgY29uc3QgcmVzdWx0ID0gYXdhaXQgc2Nhbk93bmVyUHJvbXB0cyh7IHNpbmNlRXBvY2hNczogMCwgaG9tZURpcmVjdG9yeTogaG9tZSwgcmVzb2x2ZVByb2plY3Q6ICgpID0+ICdleGFtcGxlJyB9KTsKKyAgICAgIGV4cGVjdChyZXN1bHQub3duZXJQcm9tcHRzLm1hcChwcm9tcHQgPT4gcHJvbXB0LnRleHQpKS50b0VxdWFsKFsnZXhwbGFpbiB0aGUgb3JpZ2luYWwgYmVoYXZpb3InLCAnY29udGludWUgaW4gdGhlIHJlc3VtZWQgc2Vzc2lvbiddKTsKKyAgICAgIGV4cGVjdChyZXN1bHQuYWdlbnRzLmZpbmQoYWdlbnQgPT4gYWdlbnQuaWQgPT09ICdnZW1pbmktY2xpJykhLnR5cGVkKS50b0JlKDIpOworICAgIH0gZmluYWxseSB7IHJtU3luYyhob21lLCB7IHJlY3Vyc2l2ZTogdHJ1ZSwgZm9yY2U6IHRydWUgfSk7IH0KKyAgfSk7Cit9CisKK2l0KCdrZWVwcyBkaXN0aW5jdCBHZW1pbmkgdHVybnMgYW5kIGEgY2hhbmdlZCByZXZpc2lvbiByYXRoZXIgdGhhbiBkZWR1cGxpY2F0aW5nIG9ubHkgYnkgdGV4dCBvciBpZCcsIGFzeW5jICgpID0+IHsKKyAgY29uc3QgaG9tZSA9IG1rZHRlbXBTeW5jKGpvaW4odG1wZGlyKCksICdnZW1pbmktZGlzdGluY3QtdHVybnMtJykpOworICB0cnkgeworICAgIGNvbnN0IGNoYXRzID0gam9pbihob21lLCAnLmdlbWluaScsICd0bXAnLCAnZXhhbXBsZScsICdjaGF0cycpOworICAgIG1rZGlyU3luYyhjaGF0cywgeyByZWN1cnNpdmU6IHRydWUgfSk7CisgICAgY29uc3QgaGVhZGVyID0geyBzZXNzaW9uSWQ6ICdkaXN0aW5jdC1zZXNzaW9uJywga2luZDogJ21haW4nIH07CisgICAgY29uc3Qgb3JpZ2luYWwgPSB7IGlkOiAnZmlyc3QnLCB0eXBlOiAndXNlcicsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDA6MDBaJywgY29udGVudDogJ2NvbnRpbnVlJyB9OworICAgIGNvbnN0IHJldmlzaW9uID0geyAuLi5vcmlnaW5hbCwgY29udGVudDogJ2NvbnRpbnVlIHdpdGggdGhlIGNvcnJlY3RlZCBpbnN0cnVjdGlvbnMnIH07CisgICAgY29uc3QgcmVwZWF0ZWQgPSB7IC4uLm9yaWdpbmFsLCBpZDogJ3NlY29uZCcsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDI6MDBaJyB9OworICAgIHdyaXRlRmlsZVN5bmMoam9pbihjaGF0cywgJ3Nlc3Npb24tZGlzdGluY3QuanNvbicpLCBKU09OLnN0cmluZ2lmeSh7IC4uLmhlYWRlciwgbWVzc2FnZXM6IFtvcmlnaW5hbF0gfSkpOworICAgIHdyaXRlRmlsZVN5bmMoam9pbihjaGF0cywgJ3Nlc3Npb24tZGlzdGluY3QuanNvbmwnKSwgW2hlYWRlciwgcmV2aXNpb24sIHJlcGVhdGVkXS5tYXAocmVjb3JkID0+IEpTT04uc3RyaW5naWZ5KHJlY29yZCkpLmpvaW4oJ1xuJykpOworICAgIGNvbnN0IHJlc3VsdCA9IGF3YWl0IHNjYW5Pd25lclByb21wdHMoeyBzaW5jZUVwb2NoTXM6IDAsIGhvbWVEaXJlY3Rvcnk6IGhvbWUsIHJlc29sdmVQcm9qZWN0OiAoKSA9PiAnZXhhbXBsZScgfSk7CisgICAgZXhwZWN0KHJlc3VsdC5vd25lclByb21wdHMubWFwKHByb21wdCA9PiBwcm9tcHQudGV4dCkuc29ydCgpKS50b0VxdWFsKFsnY29udGludWUnLCAnY29udGludWUnLCAnY29udGludWUgd2l0aCB0aGUgY29ycmVjdGVkIGluc3RydWN0aW9ucyddKTsKKyAgICBleHBlY3QocmVzdWx0LmFnZW50cy5maW5kKGFnZW50ID0+IGFnZW50LmlkID09PSAnZ2VtaW5pLWNsaScpIS50eXBlZCkudG9CZSgzKTsKKyAgfSBmaW5hbGx5IHsgcm1TeW5jKGhvbWUsIHsgcmVjdXJzaXZlOiB0cnVlLCBmb3JjZTogdHJ1ZSB9KTsgfQorfSk7Cg==', 'file_hashes': {'src/services/prompt-import/readers.ts': '34dab7194346e227dc3200b92fd163204f2531bf237a5e6fdb5dccd6072a7a0d', 'tests/services/prompt-import/gemini-migration.test.ts': 'ff1323b4a70106d5921695a63ed4bb3f2daf339a2886449505580bc8a17c8e5a'}, 'baseline_helper': '5da84d104290ff0f2af8b2ae5510a615d1bf95a3db2037ebb7c4238d51b866c9', 'all_names': ['imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (legacy ids)', 'imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (native ids)', 'keeps distinct Gemini turns and a changed revision rather than deduplicating only by text or id'], 'fail_names': ['imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (legacy ids)', 'imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (native ids)'], 'production_path': 'src/services/prompt-import/readers.ts', 'test_path': 'tests/services/prompt-import/gemini-migration.test.ts', 'consumer_files': ['tests/services/prompt-import/readers.test.ts', 'tests/services/prompt-import/setup-scan.test.ts', 'tests/services/prompt-import/token-usage.test.ts']}\nTASK = pathlib.Path(os.environ['RUNNER_TEMP']) / 'claude-mem-qualification'\nSRC = TASK / 'source'\nEVIDENCE = TASK / 'evidence'\nINPUT = TASK / 'input'\nEVIDENCE.mkdir(parents=True, exist_ok=True)\nINPUT.mkdir(parents=True, exist_ok=True)\nOWNED = set(CFG['file_hashes'])\nGENERATED_PREFIXES = ('plugin/scripts/', 'plugin/sqlite/', 'plugin/ui/')\nGENERATED_FILES = {\n 'plugin/skills/request-progress/scripts/request-groups.mjs',\n 'plugin/package.json','plugin/bun.lock','dsh/package.json',\n '.codex-plugin/plugin.json','plugin/.codex-plugin/plugin.json',\n '.qoder-plugin/plugin.json','plugin/.qoder-plugin/plugin.json',\n '.claude-plugin/plugin.json','plugin/.claude-plugin/plugin.json',\n '.claude-plugin/marketplace.json','.grok-plugin/plugin.json',\n 'openclaw/openclaw.plugin.json',\n 'claude-mem-cursor/.cursor-plugin/plugin.json',\n 'claude-mem-grok-bot/.cursor-plugin/plugin.json',\n 'plugin/skills/how-it-works/onboarding-explainer.md',\n}\ndef sha(p):\n return hashlib.sha256(p.read_bytes()).hexdigest()\ndef call(args, **kwargs):\n return subprocess.run(args, cwd=SRC, check=True, capture_output=True, text=True, **kwargs).stdout.strip()\ndef write(name, value):\n (EVIDENCE/name).write_text(json.dumps(value,indent=2)+'\\n')\ndef generated(name):\n return name in GENERATED_FILES or name.startswith(GENERATED_PREFIXES)\ndef tracked():\n names=call(['git','ls-files','-z']).split('\\0')\n result={}\n for name in names:\n  if not name: continue\n  p=SRC/name\n  result[name]=hashlib.sha256(os.readlink(p).encode()).hexdigest() if p.is_symlink() else sha(p)\n return result\ndef tree():\n with tempfile.TemporaryDirectory(prefix='index-',dir=TASK) as td:\n  env=dict(os.environ,GIT_INDEX_FILE=str(pathlib.Path(td)/'index'))\n  call(['git','read-tree','HEAD'],env=env)\n  call(['git','add','--',*sorted(OWNED)],env=env)\n  return call(['git','write-tree'],env=env)\ndef assert_base():\n assert call(['git','rev-parse','HEAD'])==CFG['base'], 'immutable source HEAD changed'\ndef initialize():\n assert_base()\n assert not call(['git','status','--porcelain','--untracked-files=no']), 'base must be tracked-clean'\n assert not (SRC/'package-lock.json').exists(), 'repo intentionally has no root lockfile'\n assert sha(SRC/'src/services/prompt-import/readers.ts')==CFG['baseline_helper']\n data=base64.b64decode(CFG['patch_b64'],validate=True)\n assert hashlib.sha256(data).hexdigest()==CFG['patch_sha']\n (INPUT/'candidate.patch').write_bytes(data)\n chunks=[b'diff --git '+x for x in data.split(b'diff --git ')[1:]]\n assert len(chunks)==2\n expected={\n  b'diff --git a/src/services/prompt-import/readers.ts b/src/services/prompt-import/readers.ts':'production.patch',\n  b'diff --git a/tests/services/prompt-import/gemini-migration.test.ts b/tests/services/prompt-import/gemini-migration.test.ts':'tests.patch',\n }\n for chunk in chunks:\n  first=chunk.splitlines()[0]\n  assert first in expected, first\n  (INPUT/expected[first]).write_bytes(chunk)\n write('base-tracked.json',tracked())\n write('input-provenance.json',{'base':CFG['base'],'candidate_tree':CFG['tree'],'patch_sha256':CFG['patch_sha'],'patch_parts':{p.name:sha(p) for p in INPUT.glob('*.patch')}})\ndef install_guard():\n assert_base()\n before=json.loads((EVIDENCE/'base-tracked.json').read_text())\n assert tracked()==before, 'dependency installation changed tracked source'\ndef check_junit(path, mode):\n doc=ET.parse(path)\n cases=list(doc.iter('testcase'))\n failures=[c for c in cases if c.find('failure') is not None]\n errors=[c for c in cases if c.find('error') is not None]\n skips=[c for c in cases if c.find('skipped') is not None]\n expected=30 if mode=='consumers' else 3\n assert len(cases)==expected, (len(cases),expected)\n assert not errors and not skips, 'native proof cannot be an error or skip'\n if mode=='before':\n  assert sorted(c.attrib['name'] for c in cases)==CFG['all_names']\n  assert sorted(c.attrib['name'] for c in failures)==CFG['fail_names']\n  assert all(c.find('failure').attrib.get('type')=='AssertionError' for c in failures)\n  assert len(cases)-len(failures)==1\n else:\n  assert not failures\n  if mode=='after': assert sorted(c.attrib['name'] for c in cases)==CFG['all_names']\n result={'mode':mode,'tests':len(cases),'passed':len(cases)-len(failures),'failed_names':[c.attrib['name'] for c in failures],'errors':len(errors),'skipped':len(skips)}\n write('native-'+mode+'-oracle.json',result)\n print(json.dumps(result))\ndef native(mode):\n files=['tests/services/prompt-import/gemini-migration.test.ts']\n if mode=='consumers': files += CFG['consumer_files']\n xml=EVIDENCE/('native-'+mode+'.xml')\n cmd=['bun','test',*files,'--reporter=junit','--reporter-outfile='+str(xml)]\n with (EVIDENCE/('native-'+mode+'.log')).open('w') as log:\n  r=subprocess.run(cmd,cwd=SRC,stdout=log,stderr=subprocess.STDOUT)\n assert r.returncode==(1 if mode=='before' else 0), ('unexpected native exit',mode,r.returncode)\n check_junit(xml,mode)\ndef baseline():\n install_guard()\n call(['git','apply','--check',str(INPUT/'tests.patch')])\n call(['git','apply',str(INPUT/'tests.patch')])\n call(['git','add','-N','--',CFG['test_path']])\n assert sha(SRC/'src/services/prompt-import/readers.ts')==CFG['baseline_helper']\n assert sha(SRC/'tests/services/prompt-import/gemini-migration.test.ts')==CFG['file_hashes']['tests/services/prompt-import/gemini-migration.test.ts']\n assert set(call(['git','diff','--name-only']).splitlines())=={'tests/services/prompt-import/gemini-migration.test.ts'}\n native('before')\ndef apply_candidate(full=False):\n assert_base()\n part='candidate.patch' if full else 'production.patch'\n call(['git','apply','--check',str(INPUT/part)])\n call(['git','apply',str(INPUT/part)])\n call(['git','add','-N','--',CFG['test_path']])\n assert set(call(['git','diff','--name-only']).splitlines())==OWNED\n for name,digest in CFG['file_hashes'].items(): assert sha(SRC/name)==digest,name\n assert tree()==CFG['tree'], 'candidate working tree does not match reviewed tree'\n call(['git','diff','--check'])\n write('candidate-source-guard.json',{'base':CFG['base'],'tree':tree(),'files':CFG['file_hashes'],'patch_sha256':CFG['patch_sha']})\n write('candidate-tracked.json',tracked())\ndef record_resolution():\n install_guard()\n lock=SRC/'package-lock.json'\n assert lock.exists()\n (INPUT/'package-lock.json').write_bytes(lock.read_bytes())\n record={'root_lock_provenance':'resolved once by npm from immutable public base; not a committed repository lock','sha256':sha(lock),'node':call(['node','--version']),'npm':call(['npm','--version']),'bun':call(['bun','--version']),'bun_binary_sha256':sha(pathlib.Path(call(['which','bun'])).resolve()),'package_json_sha256':sha(SRC/'package.json'),'plugin_lock_sha256':sha(SRC/'plugin/bun.lock')}\n (INPUT/'dependency-resolution.json').write_text(json.dumps(record,indent=2)+'\\n')\n write('dependency-resolution.json',record)\n with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('lock_sha='+record['sha256']+'\\n')\ndef use_resolution():\n record=json.loads((INPUT/'dependency-resolution.json').read_text())\n expected=os.environ['EXPECTED_LOCK_SHA']\n assert len(expected)==64 and all(c in '0123456789abcdef' for c in expected)\n assert record['sha256']==expected==sha(INPUT/'package-lock.json')\n assert sha(INPUT/'candidate.patch')==CFG['patch_sha'], 'downloaded patch changed'\n assert record['bun_binary_sha256']==sha(pathlib.Path(call(['which','bun'])).resolve()), 'Bun binary differs across jobs'\n assert record['package_json_sha256']==sha(SRC/'package.json')\n assert record['node']==call(['node','--version']) and record['bun']==call(['bun','--version'])\n (SRC/'package-lock.json').write_bytes((INPUT/'package-lock.json').read_bytes())\n write('downloaded-resolution-verified.json',record)\ndef protected_guard():\n assert_base()\n expected=json.loads((EVIDENCE/'candidate-tracked.json').read_text())\n actual=tracked()\n changes={name:{'before':digest,'after':actual.get(name)} for name,digest in expected.items() if actual.get(name)!=digest}\n forbidden=[name for name in changes if not generated(name)]\n write('generated-build-changes.json',{'generated_changes':changes,'forbidden_source_changes':forbidden,'note':'generated output is evidence only; never staged or published by this workflow'})\n assert not forbidden, forbidden\n for name,digest in CFG['file_hashes'].items(): assert sha(SRC/name)==digest,name\n sizes={}\n for name,budget in [('worker-service.cjs',2900*1024),('mcp-server.cjs',600*1024),('transcript-watcher.cjs',200*1024)]:\n  p=SRC/'plugin/scripts'/name\n  if p.exists(): sizes[name]={'bytes':p.stat().st_size,'sha256':sha(p),'advisory_budget_bytes':budget,'over_advisory':p.stat().st_size>budget}\n write('bundle-observations.json',{'bundles':sizes,'budgets_are_advisory_in_upstream_source':True,'hard_integrity_checks':'npm run build enforces bundle parse, absolute-path, external-Zod and distribution assertions; warnings are not hard size gates'})\n write('final-source-guard.json',{'base':CFG['base'],'reviewed_candidate_tree_before_build':CFG['tree'],'protected_source_unchanged':True})\ndef selftest():\n check_junit(pathlib.Path(sys.argv[2]),sys.argv[3])\nif __name__=='__main__':\n commands={'initialize':initialize,'install-guard':install_guard,'baseline':baseline,'apply-candidate':apply_candidate,'apply-full-candidate':lambda:apply_candidate(True),'native-after':lambda:native('after'),'native-consumers':lambda:native('consumers'),'record-resolution':record_resolution,'use-resolution':use_resolution,'protected-guard':protected_guard,'oracle-selftest':selftest}\n commands[sys.argv[1]]()\nPY_QUALIFICATION\n\ngit init \"$TASK_DIR/source\"\ngit -C \"$TASK_DIR/source\" remote add origin https://github.com/thedotmack/claude-mem.git\ngit -C \"$TASK_DIR/source\" fetch --no-tags --depth=1 origin 325afb60108d4ab04e24d715f244bd591ca33fbe\ngit -C \"$TASK_DIR/source\" checkout --detach FETCH_HEAD\ngit -C \"$TASK_DIR/source\" update-ref refs/remotes/origin/main 325afb60108d4ab04e24d715f244bd591ca33fbe\nset -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\ntest \"$(node --version)\" = \"v20.19.0\"\ntest \"$(bun --version)\" = \"1.4.2\"\npython3 \"$TASK_DIR/qualification.py\" initialize\n"
+        },
+        {
+          "name": "Download verified dependency-resolution snapshot",
+          "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+          "with": {
+            "name": "claude-mem-marker-inputs",
+            "path": "${{ runner.temp }}/claude-mem-qualification/resolution-download",
+            "run-id": 41013383947,
+            "github-token": "${{ github.token }}"
+          }
+        },
+        {
+          "name": "Import only verified dependency resolution without overwriting new patches",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\ncp \"$TASK_DIR/resolution-download/package-lock.json\" \"$TASK_DIR/input/package-lock.json\"\ncp \"$TASK_DIR/resolution-download/dependency-resolution.json\" \"$TASK_DIR/input/dependency-resolution.json\"\n"
+        },
+        {
+          "name": "Verify captured lock, frozen install, and reviewed candidate tree",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\npython3 \"$TASK_DIR/qualification.py\" use-resolution\nnpm ci --no-audit --no-fund > \"$EVIDENCE_DIR/root-frozen-install.log\" 2>&1\npython3 \"$TASK_DIR/qualification.py\" install-guard\npython3 \"$TASK_DIR/qualification.py\" apply-full-candidate\n",
+          "env": {
+            "EXPECTED_LOCK_SHA": "4fbc66f858ab6c473156741de4aab6413548c7d7651ab2be510e35c4a0abef1b"
+          },
+          "timeout-minutes": 20
+        },
+        {
+          "name": "Install Fish exactly as required by upstream hook tests",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nsudo apt-get update > \"$EVIDENCE_DIR/apt-update.log\" 2>&1\nsudo apt-get install -y fish > \"$EVIDENCE_DIR/apt-fish.log\" 2>&1\nfish --version\n",
+          "timeout-minutes": 5
+        },
+        {
+          "name": "Check committed bundles before rebuilding",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nbun test tests/infrastructure/version-consistency.test.ts tests/infrastructure/committed-plugin-bundles.test.ts > \"$EVIDENCE_DIR/committed-bundles.log\" 2>&1\n",
+          "id": "committed"
+        },
+        {
+          "name": "Root and viewer typecheck",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nnpm run typecheck > \"$EVIDENCE_DIR/typecheck.log\" 2>&1\n",
+          "id": "types"
+        },
+        {
+          "name": "Build candidate and apply upstream hard bundle/distribution assertions",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nnpm run build > \"$EVIDENCE_DIR/build.log\" 2>&1\npython3 \"$TASK_DIR/qualification.py\" protected-guard\n",
+          "id": "build",
+          "timeout-minutes": 15
+        },
+        {
+          "name": "Prove test-lane coverage",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nbun scripts/test-lanes.ts check > \"$EVIDENCE_DIR/lane-coverage.log\" 2>&1\n",
+          "id": "lane_coverage"
+        },
+        {
+          "name": "Full fast lane",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nenv -u CLAUDE_CONFIG_DIR -u CLAUDE_MEM_DATA_DIR bun scripts/test-lanes.ts fast > \"$EVIDENCE_DIR/fast.log\" 2>&1\n",
+          "id": "fast",
+          "timeout-minutes": 18
+        },
+        {
+          "name": "Full integration lane",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nenv -u CLAUDE_CONFIG_DIR -u CLAUDE_MEM_DATA_DIR bun scripts/test-lanes.ts integration > \"$EVIDENCE_DIR/integration.log\" 2>&1\n",
+          "id": "integration",
+          "if": "${{ !cancelled() && steps.build.outcome == 'success' }}",
+          "timeout-minutes": 25
+        },
+        {
+          "name": "Required out-of-tree suites and Python provider tests",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nenv -u CLAUDE_CONFIG_DIR -u CLAUDE_MEM_DATA_DIR bun test openclaw > \"$EVIDENCE_DIR/openclaw.log\" 2>&1\nenv -u CLAUDE_CONFIG_DIR -u CLAUDE_MEM_DATA_DIR bun test src/ui/my-work/src/live src/ui/my-work/src/setup src/ui/my-work/src/store > \"$EVIDENCE_DIR/my-work.log\" 2>&1\nenv -u CLAUDE_CONFIG_DIR -u CLAUDE_MEM_DATA_DIR bun test cowork/test > \"$EVIDENCE_DIR/cowork.log\" 2>&1\nenv -u CLAUDE_CONFIG_DIR -u CLAUDE_MEM_DATA_DIR python3 -B -m unittest discover -s tests/hermes -v > \"$EVIDENCE_DIR/hermes.log\" 2>&1\n",
+          "if": "${{ !cancelled() && steps.build.outcome == 'success' }}",
+          "timeout-minutes": 10
+        },
+        {
+          "name": "Final protected-source and generated-artifact classification",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\npython3 \"$TASK_DIR/qualification.py\" protected-guard\n",
+          "if": "${{ !cancelled() && steps.build.outcome == 'success' }}"
+        },
+        {
+          "name": "Retain bounded proof logs and guards",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "claude-mem-gemini-migration-core",
+            "path": "${{ runner.temp }}/claude-mem-qualification/evidence",
+            "if-no-files-found": "warn",
+            "retention-days": 7
+          }
+        }
+      ],
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/additional20-gemini-migration-20261030' }}"
+    },
+    "packaging": {
+      "name": "Committed plugin freeze \u00b7 clean-room \u00b7 Linux media slice",
+      "needs": [
+        "prepare"
+      ],
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 45,
+      "steps": [
+        {
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "20.19.0"
+          }
+        },
+        {
+          "uses": "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "with": {
+            "bun-version": "1.4.2"
+          }
+        },
+        {
+          "name": "Fetch immutable public source and install proof driver",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nmkdir -p \"$TASK_DIR/evidence\" \"$TASK_DIR/input\"\ncat > \"$TASK_DIR/qualification.py\" <<'PY_QUALIFICATION'\nimport pathlib, subprocess, json, hashlib, base64, sys, os, tempfile, xml.etree.ElementTree as ET\nCFG = {'base': '325afb60108d4ab04e24d715f244bd591ca33fbe', 'tree': '01a9ac821ec32f2e84839da35e2102aac2ded6e0', 'patch_sha': '690a75513171b4f7b354b8972a1f37e8094152e101c5f803a38ec41702dea3b7', 'patch_b64': 'ZGlmZiAtLWdpdCBhL3NyYy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L3JlYWRlcnMudHMgYi9zcmMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9yZWFkZXJzLnRzCmluZGV4IGE0MmY5YmIuLjZkMTZhMTkgMTAwNjQ0Ci0tLSBhL3NyYy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L3JlYWRlcnMudHMKKysrIGIvc3JjL3NlcnZpY2VzL3Byb21wdC1pbXBvcnQvcmVhZGVycy50cwpAQCAtMzQ4LDYgKzM0OCw3IEBAIGZ1bmN0aW9uIGdlbWluaVR5cGVkVGV4dChtZXNzYWdlOiBhbnkpOiBzdHJpbmcgfCBudWxsIHsKIAogZXhwb3J0IGZ1bmN0aW9uIGNyZWF0ZUdlbWluaUNsaVJlYWRlcigpOiBBZ2VudFByb21wdFJlYWRlciB7CiAgIGxldCBwcm9qZWN0RGlyZWN0b3JpZXMgPSBuZXcgTWFwPHN0cmluZywgc3RyaW5nPigpOworICBjb25zdCBzZWVuUHJvbXB0cyA9IG5ldyBTZXQ8c3RyaW5nPigpOwogICByZXR1cm4gewogICAgIGlkOiAnZ2VtaW5pLWNsaScsCiAgICAgbGFiZWw6ICdHZW1pbmkgQ0xJJywKQEAgLTM3NSwxMCArMzc2LDE0IEBAIGV4cG9ydCBmdW5jdGlvbiBjcmVhdGVHZW1pbmlDbGlSZWFkZXIoKTogQWdlbnRQcm9tcHRSZWFkZXIgewogICAgICAgICBjb25zdCB0ZXh0ID0gZ2VtaW5pVHlwZWRUZXh0KG1lc3NhZ2UpOwogICAgICAgICBjb25zdCBhdCA9IGlzb1RvRXBvY2hNcyhtZXNzYWdlLnRpbWVzdGFtcCk7CiAgICAgICAgIGlmICh0ZXh0ID09PSBudWxsIHx8IGF0ID09PSBudWxsIHx8IGF0IDwgc2luY2VFcG9jaE1zKSBjb250aW51ZTsKKyAgICAgICAgY29uc3QgbmF0aXZlUHJvbXB0SWQgPSB0eXBlb2YgbWVzc2FnZS5pZCA9PT0gJ3N0cmluZycgJiYgbWVzc2FnZS5pZCA/IG1lc3NhZ2UuaWQgOiBmYWxsYmFja0lkKHNlc3Npb25JZCwgbWVzc2FnZS50aW1lc3RhbXAsIHRleHQpOworICAgICAgICBjb25zdCBpZGVudGl0eSA9IGZhbGxiYWNrSWQoc2Vzc2lvbklkLCBuYXRpdmVQcm9tcHRJZCwgU3RyaW5nKGF0KSwgdGV4dCk7CisgICAgICAgIGlmIChzZWVuUHJvbXB0cy5oYXMoaWRlbnRpdHkpKSBjb250aW51ZTsKKyAgICAgICAgc2VlblByb21wdHMuYWRkKGlkZW50aXR5KTsKICAgICAgICAgc2luay5wcm9tcHQoewogICAgICAgICAgIGFnZW50OiAnZ2VtaW5pLWNsaScsCiAgICAgICAgICAgc2Vzc2lvbklkLAotICAgICAgICAgIG5hdGl2ZVByb21wdElkOiB0eXBlb2YgbWVzc2FnZS5pZCA9PT0gJ3N0cmluZycgJiYgbWVzc2FnZS5pZCA/IG1lc3NhZ2UuaWQgOiBmYWxsYmFja0lkKHNlc3Npb25JZCwgbWVzc2FnZS50aW1lc3RhbXAsIHRleHQpLAorICAgICAgICAgIG5hdGl2ZVByb21wdElkLAogICAgICAgICAgIGF0LAogICAgICAgICAgIGN3ZDogcHJvamVjdERpcmVjdG9yaWVzLmdldChwcm9qZWN0TmFtZSkgPz8gbnVsbCwKICAgICAgICAgICB0ZXh0LApkaWZmIC0tZ2l0IGEvdGVzdHMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9nZW1pbmktbWlncmF0aW9uLnRlc3QudHMgYi90ZXN0cy9zZXJ2aWNlcy9wcm9tcHQtaW1wb3J0L2dlbWluaS1taWdyYXRpb24udGVzdC50cwpuZXcgZmlsZSBtb2RlIDEwMDY0NAppbmRleCAwMDAwMDAwLi5lZGY5Mzc3Ci0tLSAvZGV2L251bGwKKysrIGIvdGVzdHMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9nZW1pbmktbWlncmF0aW9uLnRlc3QudHMKQEAgLTAsMCArMSw0MCBAQAoraW1wb3J0IHsgZXhwZWN0LCBpdCB9IGZyb20gJ2J1bjp0ZXN0JzsKK2ltcG9ydCB7IG1rZGlyU3luYywgbWtkdGVtcFN5bmMsIHJtU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gJ2ZzJzsKK2ltcG9ydCB7IHRtcGRpciB9IGZyb20gJ29zJzsKK2ltcG9ydCB7IGpvaW4gfSBmcm9tICdwYXRoJzsKK2ltcG9ydCB7IHNjYW5Pd25lclByb21wdHMgfSBmcm9tICcuLi8uLi8uLi9zcmMvc2VydmljZXMvcHJvbXB0LWltcG9ydC9pbmRleC5qcyc7CisKK2ZvciAoY29uc3Qgd2l0aElkcyBvZiBbdHJ1ZSwgZmFsc2VdKSB7CisgIGl0KGBpbXBvcnRzIGVhY2ggR2VtaW5pIHByb21wdCBvbmNlIHdoZW4gYSByZXN1bWVkIEpTT04gc2Vzc2lvbiBhbHNvIGhhcyBhIEpTT05MIGNvcHkgKCR7d2l0aElkcyA/ICduYXRpdmUgaWRzJyA6ICdsZWdhY3kgaWRzJ30pYCwgYXN5bmMgKCkgPT4geworICAgIGNvbnN0IGhvbWUgPSBta2R0ZW1wU3luYyhqb2luKHRtcGRpcigpLCAnZ2VtaW5pLW1pZ3JhdGlvbi0nKSk7CisgICAgdHJ5IHsKKyAgICAgIGNvbnN0IGNoYXRzID0gam9pbihob21lLCAnLmdlbWluaScsICd0bXAnLCAnZXhhbXBsZScsICdjaGF0cycpOworICAgICAgbWtkaXJTeW5jKGNoYXRzLCB7IHJlY3Vyc2l2ZTogdHJ1ZSB9KTsKKyAgICAgIGNvbnN0IGhlYWRlciA9IHsgc2Vzc2lvbklkOiAncmVzdW1lZC1zZXNzaW9uJywga2luZDogJ21haW4nIH07CisgICAgICBjb25zdCBmaXJzdCA9IHsgLi4uKHdpdGhJZHMgPyB7IGlkOiAnZmlyc3QnIH0gOiB7fSksIHR5cGU6ICd1c2VyJywgdGltZXN0YW1wOiAnMjAyNi0wOS0xNlQwMDowMDowMFonLCBjb250ZW50OiAnZXhwbGFpbiB0aGUgb3JpZ2luYWwgYmVoYXZpb3InIH07CisgICAgICBjb25zdCBuZXh0ID0geyAuLi4od2l0aElkcyA/IHsgaWQ6ICduZXh0JyB9IDoge30pLCB0eXBlOiAndXNlcicsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDE6MDBaJywgY29udGVudDogJ2NvbnRpbnVlIGluIHRoZSByZXN1bWVkIHNlc3Npb24nIH07CisgICAgICB3cml0ZUZpbGVTeW5jKGpvaW4oY2hhdHMsICdzZXNzaW9uLXJlc3VtZWQuanNvbicpLCBKU09OLnN0cmluZ2lmeSh7IC4uLmhlYWRlciwgbWVzc2FnZXM6IFtmaXJzdF0gfSkpOworICAgICAgd3JpdGVGaWxlU3luYyhqb2luKGNoYXRzLCAnc2Vzc2lvbi1yZXN1bWVkLmpzb25sJyksIFtoZWFkZXIsIGZpcnN0LCBuZXh0XS5tYXAocmVjb3JkID0+IEpTT04uc3RyaW5naWZ5KHJlY29yZCkpLmpvaW4oJ1xuJykpOworICAgICAgY29uc3QgcmVzdWx0ID0gYXdhaXQgc2Nhbk93bmVyUHJvbXB0cyh7IHNpbmNlRXBvY2hNczogMCwgaG9tZURpcmVjdG9yeTogaG9tZSwgcmVzb2x2ZVByb2plY3Q6ICgpID0+ICdleGFtcGxlJyB9KTsKKyAgICAgIGV4cGVjdChyZXN1bHQub3duZXJQcm9tcHRzLm1hcChwcm9tcHQgPT4gcHJvbXB0LnRleHQpKS50b0VxdWFsKFsnZXhwbGFpbiB0aGUgb3JpZ2luYWwgYmVoYXZpb3InLCAnY29udGludWUgaW4gdGhlIHJlc3VtZWQgc2Vzc2lvbiddKTsKKyAgICAgIGV4cGVjdChyZXN1bHQuYWdlbnRzLmZpbmQoYWdlbnQgPT4gYWdlbnQuaWQgPT09ICdnZW1pbmktY2xpJykhLnR5cGVkKS50b0JlKDIpOworICAgIH0gZmluYWxseSB7IHJtU3luYyhob21lLCB7IHJlY3Vyc2l2ZTogdHJ1ZSwgZm9yY2U6IHRydWUgfSk7IH0KKyAgfSk7Cit9CisKK2l0KCdrZWVwcyBkaXN0aW5jdCBHZW1pbmkgdHVybnMgYW5kIGEgY2hhbmdlZCByZXZpc2lvbiByYXRoZXIgdGhhbiBkZWR1cGxpY2F0aW5nIG9ubHkgYnkgdGV4dCBvciBpZCcsIGFzeW5jICgpID0+IHsKKyAgY29uc3QgaG9tZSA9IG1rZHRlbXBTeW5jKGpvaW4odG1wZGlyKCksICdnZW1pbmktZGlzdGluY3QtdHVybnMtJykpOworICB0cnkgeworICAgIGNvbnN0IGNoYXRzID0gam9pbihob21lLCAnLmdlbWluaScsICd0bXAnLCAnZXhhbXBsZScsICdjaGF0cycpOworICAgIG1rZGlyU3luYyhjaGF0cywgeyByZWN1cnNpdmU6IHRydWUgfSk7CisgICAgY29uc3QgaGVhZGVyID0geyBzZXNzaW9uSWQ6ICdkaXN0aW5jdC1zZXNzaW9uJywga2luZDogJ21haW4nIH07CisgICAgY29uc3Qgb3JpZ2luYWwgPSB7IGlkOiAnZmlyc3QnLCB0eXBlOiAndXNlcicsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDA6MDBaJywgY29udGVudDogJ2NvbnRpbnVlJyB9OworICAgIGNvbnN0IHJldmlzaW9uID0geyAuLi5vcmlnaW5hbCwgY29udGVudDogJ2NvbnRpbnVlIHdpdGggdGhlIGNvcnJlY3RlZCBpbnN0cnVjdGlvbnMnIH07CisgICAgY29uc3QgcmVwZWF0ZWQgPSB7IC4uLm9yaWdpbmFsLCBpZDogJ3NlY29uZCcsIHRpbWVzdGFtcDogJzIwMjYtMDktMTZUMDA6MDI6MDBaJyB9OworICAgIHdyaXRlRmlsZVN5bmMoam9pbihjaGF0cywgJ3Nlc3Npb24tZGlzdGluY3QuanNvbicpLCBKU09OLnN0cmluZ2lmeSh7IC4uLmhlYWRlciwgbWVzc2FnZXM6IFtvcmlnaW5hbF0gfSkpOworICAgIHdyaXRlRmlsZVN5bmMoam9pbihjaGF0cywgJ3Nlc3Npb24tZGlzdGluY3QuanNvbmwnKSwgW2hlYWRlciwgcmV2aXNpb24sIHJlcGVhdGVkXS5tYXAocmVjb3JkID0+IEpTT04uc3RyaW5naWZ5KHJlY29yZCkpLmpvaW4oJ1xuJykpOworICAgIGNvbnN0IHJlc3VsdCA9IGF3YWl0IHNjYW5Pd25lclByb21wdHMoeyBzaW5jZUVwb2NoTXM6IDAsIGhvbWVEaXJlY3Rvcnk6IGhvbWUsIHJlc29sdmVQcm9qZWN0OiAoKSA9PiAnZXhhbXBsZScgfSk7CisgICAgZXhwZWN0KHJlc3VsdC5vd25lclByb21wdHMubWFwKHByb21wdCA9PiBwcm9tcHQudGV4dCkuc29ydCgpKS50b0VxdWFsKFsnY29udGludWUnLCAnY29udGludWUnLCAnY29udGludWUgd2l0aCB0aGUgY29ycmVjdGVkIGluc3RydWN0aW9ucyddKTsKKyAgICBleHBlY3QocmVzdWx0LmFnZW50cy5maW5kKGFnZW50ID0+IGFnZW50LmlkID09PSAnZ2VtaW5pLWNsaScpIS50eXBlZCkudG9CZSgzKTsKKyAgfSBmaW5hbGx5IHsgcm1TeW5jKGhvbWUsIHsgcmVjdXJzaXZlOiB0cnVlLCBmb3JjZTogdHJ1ZSB9KTsgfQorfSk7Cg==', 'file_hashes': {'src/services/prompt-import/readers.ts': '34dab7194346e227dc3200b92fd163204f2531bf237a5e6fdb5dccd6072a7a0d', 'tests/services/prompt-import/gemini-migration.test.ts': 'ff1323b4a70106d5921695a63ed4bb3f2daf339a2886449505580bc8a17c8e5a'}, 'baseline_helper': '5da84d104290ff0f2af8b2ae5510a615d1bf95a3db2037ebb7c4238d51b866c9', 'all_names': ['imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (legacy ids)', 'imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (native ids)', 'keeps distinct Gemini turns and a changed revision rather than deduplicating only by text or id'], 'fail_names': ['imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (legacy ids)', 'imports each Gemini prompt once when a resumed JSON session also has a JSONL copy (native ids)'], 'production_path': 'src/services/prompt-import/readers.ts', 'test_path': 'tests/services/prompt-import/gemini-migration.test.ts', 'consumer_files': ['tests/services/prompt-import/readers.test.ts', 'tests/services/prompt-import/setup-scan.test.ts', 'tests/services/prompt-import/token-usage.test.ts']}\nTASK = pathlib.Path(os.environ['RUNNER_TEMP']) / 'claude-mem-qualification'\nSRC = TASK / 'source'\nEVIDENCE = TASK / 'evidence'\nINPUT = TASK / 'input'\nEVIDENCE.mkdir(parents=True, exist_ok=True)\nINPUT.mkdir(parents=True, exist_ok=True)\nOWNED = set(CFG['file_hashes'])\nGENERATED_PREFIXES = ('plugin/scripts/', 'plugin/sqlite/', 'plugin/ui/')\nGENERATED_FILES = {\n 'plugin/skills/request-progress/scripts/request-groups.mjs',\n 'plugin/package.json','plugin/bun.lock','dsh/package.json',\n '.codex-plugin/plugin.json','plugin/.codex-plugin/plugin.json',\n '.qoder-plugin/plugin.json','plugin/.qoder-plugin/plugin.json',\n '.claude-plugin/plugin.json','plugin/.claude-plugin/plugin.json',\n '.claude-plugin/marketplace.json','.grok-plugin/plugin.json',\n 'openclaw/openclaw.plugin.json',\n 'claude-mem-cursor/.cursor-plugin/plugin.json',\n 'claude-mem-grok-bot/.cursor-plugin/plugin.json',\n 'plugin/skills/how-it-works/onboarding-explainer.md',\n}\ndef sha(p):\n return hashlib.sha256(p.read_bytes()).hexdigest()\ndef call(args, **kwargs):\n return subprocess.run(args, cwd=SRC, check=True, capture_output=True, text=True, **kwargs).stdout.strip()\ndef write(name, value):\n (EVIDENCE/name).write_text(json.dumps(value,indent=2)+'\\n')\ndef generated(name):\n return name in GENERATED_FILES or name.startswith(GENERATED_PREFIXES)\ndef tracked():\n names=call(['git','ls-files','-z']).split('\\0')\n result={}\n for name in names:\n  if not name: continue\n  p=SRC/name\n  result[name]=hashlib.sha256(os.readlink(p).encode()).hexdigest() if p.is_symlink() else sha(p)\n return result\ndef tree():\n with tempfile.TemporaryDirectory(prefix='index-',dir=TASK) as td:\n  env=dict(os.environ,GIT_INDEX_FILE=str(pathlib.Path(td)/'index'))\n  call(['git','read-tree','HEAD'],env=env)\n  call(['git','add','--',*sorted(OWNED)],env=env)\n  return call(['git','write-tree'],env=env)\ndef assert_base():\n assert call(['git','rev-parse','HEAD'])==CFG['base'], 'immutable source HEAD changed'\ndef initialize():\n assert_base()\n assert not call(['git','status','--porcelain','--untracked-files=no']), 'base must be tracked-clean'\n assert not (SRC/'package-lock.json').exists(), 'repo intentionally has no root lockfile'\n assert sha(SRC/'src/services/prompt-import/readers.ts')==CFG['baseline_helper']\n data=base64.b64decode(CFG['patch_b64'],validate=True)\n assert hashlib.sha256(data).hexdigest()==CFG['patch_sha']\n (INPUT/'candidate.patch').write_bytes(data)\n chunks=[b'diff --git '+x for x in data.split(b'diff --git ')[1:]]\n assert len(chunks)==2\n expected={\n  b'diff --git a/src/services/prompt-import/readers.ts b/src/services/prompt-import/readers.ts':'production.patch',\n  b'diff --git a/tests/services/prompt-import/gemini-migration.test.ts b/tests/services/prompt-import/gemini-migration.test.ts':'tests.patch',\n }\n for chunk in chunks:\n  first=chunk.splitlines()[0]\n  assert first in expected, first\n  (INPUT/expected[first]).write_bytes(chunk)\n write('base-tracked.json',tracked())\n write('input-provenance.json',{'base':CFG['base'],'candidate_tree':CFG['tree'],'patch_sha256':CFG['patch_sha'],'patch_parts':{p.name:sha(p) for p in INPUT.glob('*.patch')}})\ndef install_guard():\n assert_base()\n before=json.loads((EVIDENCE/'base-tracked.json').read_text())\n assert tracked()==before, 'dependency installation changed tracked source'\ndef check_junit(path, mode):\n doc=ET.parse(path)\n cases=list(doc.iter('testcase'))\n failures=[c for c in cases if c.find('failure') is not None]\n errors=[c for c in cases if c.find('error') is not None]\n skips=[c for c in cases if c.find('skipped') is not None]\n expected=30 if mode=='consumers' else 3\n assert len(cases)==expected, (len(cases),expected)\n assert not errors and not skips, 'native proof cannot be an error or skip'\n if mode=='before':\n  assert sorted(c.attrib['name'] for c in cases)==CFG['all_names']\n  assert sorted(c.attrib['name'] for c in failures)==CFG['fail_names']\n  assert all(c.find('failure').attrib.get('type')=='AssertionError' for c in failures)\n  assert len(cases)-len(failures)==1\n else:\n  assert not failures\n  if mode=='after': assert sorted(c.attrib['name'] for c in cases)==CFG['all_names']\n result={'mode':mode,'tests':len(cases),'passed':len(cases)-len(failures),'failed_names':[c.attrib['name'] for c in failures],'errors':len(errors),'skipped':len(skips)}\n write('native-'+mode+'-oracle.json',result)\n print(json.dumps(result))\ndef native(mode):\n files=['tests/services/prompt-import/gemini-migration.test.ts']\n if mode=='consumers': files += CFG['consumer_files']\n xml=EVIDENCE/('native-'+mode+'.xml')\n cmd=['bun','test',*files,'--reporter=junit','--reporter-outfile='+str(xml)]\n with (EVIDENCE/('native-'+mode+'.log')).open('w') as log:\n  r=subprocess.run(cmd,cwd=SRC,stdout=log,stderr=subprocess.STDOUT)\n assert r.returncode==(1 if mode=='before' else 0), ('unexpected native exit',mode,r.returncode)\n check_junit(xml,mode)\ndef baseline():\n install_guard()\n call(['git','apply','--check',str(INPUT/'tests.patch')])\n call(['git','apply',str(INPUT/'tests.patch')])\n call(['git','add','-N','--',CFG['test_path']])\n assert sha(SRC/'src/services/prompt-import/readers.ts')==CFG['baseline_helper']\n assert sha(SRC/'tests/services/prompt-import/gemini-migration.test.ts')==CFG['file_hashes']['tests/services/prompt-import/gemini-migration.test.ts']\n assert set(call(['git','diff','--name-only']).splitlines())=={'tests/services/prompt-import/gemini-migration.test.ts'}\n native('before')\ndef apply_candidate(full=False):\n assert_base()\n part='candidate.patch' if full else 'production.patch'\n call(['git','apply','--check',str(INPUT/part)])\n call(['git','apply',str(INPUT/part)])\n call(['git','add','-N','--',CFG['test_path']])\n assert set(call(['git','diff','--name-only']).splitlines())==OWNED\n for name,digest in CFG['file_hashes'].items(): assert sha(SRC/name)==digest,name\n assert tree()==CFG['tree'], 'candidate working tree does not match reviewed tree'\n call(['git','diff','--check'])\n write('candidate-source-guard.json',{'base':CFG['base'],'tree':tree(),'files':CFG['file_hashes'],'patch_sha256':CFG['patch_sha']})\n write('candidate-tracked.json',tracked())\ndef record_resolution():\n install_guard()\n lock=SRC/'package-lock.json'\n assert lock.exists()\n (INPUT/'package-lock.json').write_bytes(lock.read_bytes())\n record={'root_lock_provenance':'resolved once by npm from immutable public base; not a committed repository lock','sha256':sha(lock),'node':call(['node','--version']),'npm':call(['npm','--version']),'bun':call(['bun','--version']),'bun_binary_sha256':sha(pathlib.Path(call(['which','bun'])).resolve()),'package_json_sha256':sha(SRC/'package.json'),'plugin_lock_sha256':sha(SRC/'plugin/bun.lock')}\n (INPUT/'dependency-resolution.json').write_text(json.dumps(record,indent=2)+'\\n')\n write('dependency-resolution.json',record)\n with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('lock_sha='+record['sha256']+'\\n')\ndef use_resolution():\n record=json.loads((INPUT/'dependency-resolution.json').read_text())\n expected=os.environ['EXPECTED_LOCK_SHA']\n assert len(expected)==64 and all(c in '0123456789abcdef' for c in expected)\n assert record['sha256']==expected==sha(INPUT/'package-lock.json')\n assert sha(INPUT/'candidate.patch')==CFG['patch_sha'], 'downloaded patch changed'\n assert record['bun_binary_sha256']==sha(pathlib.Path(call(['which','bun'])).resolve()), 'Bun binary differs across jobs'\n assert record['package_json_sha256']==sha(SRC/'package.json')\n assert record['node']==call(['node','--version']) and record['bun']==call(['bun','--version'])\n (SRC/'package-lock.json').write_bytes((INPUT/'package-lock.json').read_bytes())\n write('downloaded-resolution-verified.json',record)\ndef protected_guard():\n assert_base()\n expected=json.loads((EVIDENCE/'candidate-tracked.json').read_text())\n actual=tracked()\n changes={name:{'before':digest,'after':actual.get(name)} for name,digest in expected.items() if actual.get(name)!=digest}\n forbidden=[name for name in changes if not generated(name)]\n write('generated-build-changes.json',{'generated_changes':changes,'forbidden_source_changes':forbidden,'note':'generated output is evidence only; never staged or published by this workflow'})\n assert not forbidden, forbidden\n for name,digest in CFG['file_hashes'].items(): assert sha(SRC/name)==digest,name\n sizes={}\n for name,budget in [('worker-service.cjs',2900*1024),('mcp-server.cjs',600*1024),('transcript-watcher.cjs',200*1024)]:\n  p=SRC/'plugin/scripts'/name\n  if p.exists(): sizes[name]={'bytes':p.stat().st_size,'sha256':sha(p),'advisory_budget_bytes':budget,'over_advisory':p.stat().st_size>budget}\n write('bundle-observations.json',{'bundles':sizes,'budgets_are_advisory_in_upstream_source':True,'hard_integrity_checks':'npm run build enforces bundle parse, absolute-path, external-Zod and distribution assertions; warnings are not hard size gates'})\n write('final-source-guard.json',{'base':CFG['base'],'reviewed_candidate_tree_before_build':CFG['tree'],'protected_source_unchanged':True})\ndef selftest():\n check_junit(pathlib.Path(sys.argv[2]),sys.argv[3])\nif __name__=='__main__':\n commands={'initialize':initialize,'install-guard':install_guard,'baseline':baseline,'apply-candidate':apply_candidate,'apply-full-candidate':lambda:apply_candidate(True),'native-after':lambda:native('after'),'native-consumers':lambda:native('consumers'),'record-resolution':record_resolution,'use-resolution':use_resolution,'protected-guard':protected_guard,'oracle-selftest':selftest}\n commands[sys.argv[1]]()\nPY_QUALIFICATION\n\ngit init \"$TASK_DIR/source\"\ngit -C \"$TASK_DIR/source\" remote add origin https://github.com/thedotmack/claude-mem.git\ngit -C \"$TASK_DIR/source\" fetch --no-tags --depth=1 origin 325afb60108d4ab04e24d715f244bd591ca33fbe\ngit -C \"$TASK_DIR/source\" checkout --detach FETCH_HEAD\ngit -C \"$TASK_DIR/source\" update-ref refs/remotes/origin/main 325afb60108d4ab04e24d715f244bd591ca33fbe\nset -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\ntest \"$(node --version)\" = \"v20.19.0\"\ntest \"$(bun --version)\" = \"1.4.2\"\npython3 \"$TASK_DIR/qualification.py\" initialize\n"
+        },
+        {
+          "name": "Download verified dependency-resolution snapshot",
+          "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+          "with": {
+            "name": "claude-mem-marker-inputs",
+            "path": "${{ runner.temp }}/claude-mem-qualification/resolution-download",
+            "run-id": 41013383947,
+            "github-token": "${{ github.token }}"
+          }
+        },
+        {
+          "name": "Import only verified dependency resolution without overwriting new patches",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\ncp \"$TASK_DIR/resolution-download/package-lock.json\" \"$TASK_DIR/input/package-lock.json\"\ncp \"$TASK_DIR/resolution-download/dependency-resolution.json\" \"$TASK_DIR/input/dependency-resolution.json\"\n"
+        },
+        {
+          "name": "Verify captured lock, frozen install, and reviewed candidate tree",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\npython3 \"$TASK_DIR/qualification.py\" use-resolution\nnpm ci --no-audit --no-fund > \"$EVIDENCE_DIR/root-frozen-install.log\" 2>&1\npython3 \"$TASK_DIR/qualification.py\" install-guard\npython3 \"$TASK_DIR/qualification.py\" apply-full-candidate\n",
+          "env": {
+            "EXPECTED_LOCK_SHA": "4fbc66f858ab6c473156741de4aab6413548c7d7651ab2be510e35c4a0abef1b"
+          },
+          "timeout-minutes": 20
+        },
+        {
+          "name": "Committed plugin frozen-lock drift check",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nsha256sum plugin/package.json plugin/bun.lock > \"$EVIDENCE_DIR/plugin-pair-before.sha256\"\n(cd plugin && bun install --frozen-lockfile --ignore-scripts) > \"$EVIDENCE_DIR/plugin-frozen-install.log\" 2>&1\nsha256sum -c \"$EVIDENCE_DIR/plugin-pair-before.sha256\"\n",
+          "timeout-minutes": 12
+        },
+        {
+          "name": "Build and check install-script allowlist",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nnpm run build > \"$EVIDENCE_DIR/build.log\" 2>&1\nnpm run check:postinstall-allowlist > \"$EVIDENCE_DIR/postinstall-allowlist.log\" 2>&1\npython3 \"$TASK_DIR/qualification.py\" protected-guard\n",
+          "id": "build",
+          "timeout-minutes": 15
+        },
+        {
+          "name": "Clean-room packaged dependency/runtime smoke",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nnpm run smoke:clean-room > \"$EVIDENCE_DIR/clean-room.log\" 2>&1\n",
+          "timeout-minutes": 20
+        },
+        {
+          "name": "Linux native media runtime slice triggered by src/**",
+          "run": "set -euo pipefail\nTASK_DIR=\"$RUNNER_TEMP/claude-mem-qualification\"\nSOURCE_DIR=\"$TASK_DIR/source\"\nEVIDENCE_DIR=\"$TASK_DIR/evidence\"\nINPUT_DIR=\"$TASK_DIR/input\"\nTASK_HOME=\"$TASK_DIR/home\"\nexport CLAUDE_CONFIG_DIR=\"$TASK_HOME/.claude\"\nexport CLAUDE_MEM_DATA_DIR=\"$TASK_HOME/.claude-mem\"\nexport XDG_CONFIG_HOME=\"$TASK_HOME/.config\"\nexport XDG_DATA_HOME=\"$TASK_HOME/.local/share\"\nexport XDG_CACHE_HOME=\"$TASK_HOME/.cache\"\nexport npm_config_cache=\"$TASK_DIR/npm-cache\"\nexport BUN_INSTALL_CACHE_DIR=\"$TASK_DIR/bun-cache\"\nexport DO_NOT_TRACK=1\nexport CLAUDE_MEM_TELEMETRY=0\nmkdir -p \"$EVIDENCE_DIR\" \"$INPUT_DIR\" \"$TASK_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_MEM_DATA_DIR\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\"\nunset CLAUDE_PLUGIN_ROOT PLUGIN_ROOT ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY CLAUDE_CODE_OAUTH_TOKEN COMPOSIO_API_KEY\ncd \"$SOURCE_DIR\"\nnpm run test:media-converter > \"$EVIDENCE_DIR/media-converter.log\" 2>&1\nbun test tests/media/contract.test.ts tests/media/evaluation.test.ts > \"$EVIDENCE_DIR/media-contract.log\" 2>&1\nbun scripts/media/evaluate.ts > \"$EVIDENCE_DIR/media-evaluation.log\" 2>&1\npython3 \"$TASK_DIR/qualification.py\" protected-guard\n",
+          "if": "${{ !cancelled() && steps.build.outcome == 'success' }}",
+          "timeout-minutes": 10
+        },
+        {
+          "name": "Retain bounded proof logs and guards",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "claude-mem-gemini-migration-packaging",
+            "path": "${{ runner.temp }}/claude-mem-qualification/evidence",
+            "if-no-files-found": "warn",
+            "retention-days": 7
+          }
+        }
+      ],
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/additional20-gemini-migration-20261030' }}"
+    }
+  }
+}
