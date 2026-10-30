@@ -1,249 +1,59 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
-jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+{
+  "name": "Thinkrail draft image baseline oracle only",
+  "on": {
+    "push": {
+      "branches": [
+        "validation/thinkrail-draft-baseline-20261030"
+      ]
+    },
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "baseline": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 30,
+      "steps": [
+        {
+          "name": "Use pinned Node",
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "22.19.0"
+          }
+        },
+        {
+          "name": "Install verified official Bun1.4.4",
+          "shell": "bash",
+          "run": "set -euo pipefail\npython3 - <<'PYINSTALL'\nimport urllib.request,json,hashlib,base64,tarfile,io,pathlib,os\np=pathlib.Path(os.environ['RUNNER_TEMP'])/'bun144';p.mkdir()\nm=json.load(urllib.request.urlopen('https://registry.npmjs.org/@oven%2fbun-linux-x64/1.4.4',timeout=30))\nassert m['name']=='@oven/bun-linux-x64' and m['version']=='1.4.4'\nu=m['dist']['tarball'];assert u.startswith('https://registry.npmjs.org/')\nb=urllib.request.urlopen(u,timeout=90).read();assert 'sha512-'+base64.b64encode(hashlib.sha512(b).digest()).decode()==m['dist']['integrity']\nwith tarfile.open(fileobj=io.BytesIO(b),mode='r:gz') as t:\n matches=[x for x in t.getmembers() if x.isfile() and x.name.endswith('/bin/bun')];assert len(matches)==1\n (p/'bun').write_bytes(t.extractfile(matches[0]).read());(p/'bun').chmod(0o755)\nwith open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(p)+'\\n')\nPYINSTALL\n"
+        },
+        {
+          "name": "Fetch immutable public source and apply regression only",
+          "shell": "bash",
+          "run": "set -euo pipefail\nmkdir -p \"$RUNNER_TEMP/thinkrail\"\ncd \"$RUNNER_TEMP/thinkrail\"\ngit init -q\ngit remote add origin https://github.com/JetBrains/thinkrail.git\ngit fetch --depth=1 origin df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\ngit checkout --detach FETCH_HEAD\ntest \"$(git rev-parse HEAD)\" = \"df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\"\npython3 - <<'PYPATCH'\nimport base64,hashlib,pathlib\nb=base64.b64decode('LS0tIGEvZTJlL2NvbXBvc2VyLWltYWdlcy5zcGVjLnRzCisrKyBiL2UyZS9jb21wb3Nlci1pbWFnZXMuc3BlYy50cwpAQCAtMSw1ICsxLDUgQEAKIGltcG9ydCB7IGV4cGVjdCwgdGVzdCB9IGZyb20gIkBwbGF5d3JpZ2h0L3Rlc3QiOwotaW1wb3J0IHsgY3JlYXRlV29ya3NwYWNlVmlhRGlhbG9nLCBvcGVuRml4dHVyZVByb2plY3QgfSBmcm9tICIuL2ZpeHR1cmVzL2FwcCI7CitpbXBvcnQgeyBjcmVhdGVXb3Jrc3BhY2VWaWFEaWFsb2csIG9wZW5GaXh0dXJlUHJvamVjdCwgcmV2ZWFsV29ya2JlbmNoVG9vbCB9IGZyb20gIi4vZml4dHVyZXMvYXBwIjsKIAogYXN5bmMgZnVuY3Rpb24gb3BlbkNoYXRDb21wb3NlcihwYWdlOiBpbXBvcnQoIkBwbGF5d3JpZ2h0L3Rlc3QiKS5QYWdlKTogUHJvbWlzZTx2b2lkPiB7CiAJYXdhaXQgb3BlbkZpeHR1cmVQcm9qZWN0KHBhZ2UpOwpAQCAtMTM2LDMgKzEzNiwyMSBAQAogCWF3YWl0IGV4cGVjdChwYWdlLmdldEJ5VGVzdElkKCJjb21wb3Nlci1jb21tYW5kLWVycm9yIikpLnRvSGF2ZUNvdW50KDApOwogCWF3YWl0IGV4cGVjdChpbnB1dCkudG9IYXZlVmFsdWUoY29tbWFuZCk7CiB9KTsKKworCit0ZXN0KCJkcmFmdCBpbWFnZSBhdHRhY2htZW50cyBzdXJ2aXZlIGEgY2hhdCB0YWIgcmVtb3VudCIsIGFzeW5jICh7IHBhZ2UgfSwgdGVzdEluZm8pID0+IHsKKwlhd2FpdCBvcGVuQ2hhdENvbXBvc2VyKHBhZ2UpOworCWF3YWl0IHBhZ2UuZ2V0QnlUZXN0SWQoImNoYXQtaW5wdXQiKS5maWxsKCJLZWVwIHRoaXMgdGV4dCBhbmQgaW1hZ2UgdG9nZXRoZXIiKTsKKwlhd2FpdCBwYXN0ZVBuZyhwYWdlLCA2NDAsIDQ4MCk7CisJYXdhaXQgZXhwZWN0KHBhZ2UuZ2V0QnlUZXN0SWQoImNvbXBvc2VyLWltYWdlIikpLnRvSGF2ZUNvdW50KDEpOworCWNvbnN0IGNoYXRUYWIgPSBwYWdlLmxvY2F0b3IoJ1tkYXRhLXRlc3RpZD0iZWRpdG9yLXRhYiJdW2RhdGEta2luZD0iY2hhdCJdJyk7CisJYXdhaXQgcmV2ZWFsV29ya2JlbmNoVG9vbChwYWdlLCAiZmlsZXMiKTsKKwlhd2FpdCBwYWdlLmdldEJ5VGVzdElkKCJmaWxlLW5vZGUiKS5maWx0ZXIoeyBoYXNUZXh0OiAiUkVBRE1FLm1kIiB9KS5kYmxjbGljaygpOworCWF3YWl0IGV4cGVjdChwYWdlLmdldEJ5VGVzdElkKCJjaGF0LWlucHV0IikpLnRvSGF2ZUNvdW50KDApOworCWF3YWl0IGNoYXRUYWIuZ2V0QnlSb2xlKCJ0YWIiKS5jbGljaygpOworCWF3YWl0IGV4cGVjdChwYWdlLmdldEJ5VGVzdElkKCJjaGF0LWlucHV0IikpLnRvSGF2ZVZhbHVlKCJLZWVwIHRoaXMgdGV4dCBhbmQgaW1hZ2UgdG9nZXRoZXIiKTsKKwlhd2FpdCBwYWdlLnNjcmVlbnNob3QoeyBwYXRoOiB0ZXN0SW5mby5vdXRwdXRQYXRoKCJkcmFmdC1pbWFnZS1hZnRlci1yZW1vdW50LnBuZyIpIH0pOworCWF3YWl0IGV4cGVjdChwYWdlLmdldEJ5VGVzdElkKCJjb21wb3Nlci1pbWFnZSIpKS50b0hhdmVDb3VudCgxKTsKKwlhd2FpdCBleHBlY3QocGFnZS5nZXRCeVRlc3RJZCgiY29tcG9zZXItaW1hZ2UiKSkudG9IYXZlQXR0cmlidXRlKCJkYXRhLXdpZHRoIiwgIjY0MCIpOworCWF3YWl0IGV4cGVjdChwYWdlLmdldEJ5VGVzdElkKCJjb21wb3Nlci1pbWFnZSIpKS50b0hhdmVBdHRyaWJ1dGUoImRhdGEtaGVpZ2h0IiwgIjQ4MCIpOworfSk7Cg==');assert hashlib.sha256(b).hexdigest()=='4b70358a4cd1849367325ec05df58d5e80b23632d58d4dad8043d54895ee36a6'\npathlib.Path('/tmp/thinkrail-draft-regression.patch').write_bytes(b)\nPYPATCH\ngit apply --check /tmp/thinkrail-draft-regression.patch\ngit apply /tmp/thinkrail-draft-regression.patch\ngit diff --check\n"
+        },
+        {
+          "name": "Install exact repository dependencies and browser",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\ntest \"$(bun --version)\" = \"1.4.4\"\nbun install --frozen-lockfile\nbunx playwright install --with-deps chromium\n"
+        },
+        {
+          "name": "Require the native pre-fix failure signature",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nmkdir -p \"$RUNNER_TEMP/thinkrail-proof\"\nset +e\nPLAYWRIGHT_JSON_OUTPUT_FILE=\"$RUNNER_TEMP/thinkrail-proof/baseline.json\" bun run e2e -- --serial e2e/composer-images.spec.ts -g \"draft image attachments survive a chat tab remount\" --retries=0 --workers=1 --reporter=json > \"$RUNNER_TEMP/thinkrail-proof/baseline.log\" 2>&1\nstatus=$?\nset -e\nexport BASELINE_STATUS=\"$status\"\npython3 - <<'PYORACLE'\nimport pathlib,json,os,re\np=pathlib.Path(os.environ['RUNNER_TEMP'])/'thinkrail-proof';d=json.loads((p/'baseline.json').read_text())\nassert not d.get('errors'), d.get('errors')\nrows=[]\ndef walk(s):\n for spec in s.get('specs',[]):\n  if spec['title']=='draft image attachments survive a chat tab remount':rows.extend(spec['tests'])\n for child in s.get('suites',[]):walk(child)\nwalk(d)\nassert len(rows)==1,rows\nresults=rows[0]['results'];assert len(results)==1,results\nresult=results[0];assert result['status']=='failed',result\nerrors='\\n'.join(e.get('message','') for e in result.get('errors',[]))\nerrors=re.sub(r'\\x1b\\[[0-9;]*m','',errors)\nassert 'composer-image' in errors and 'Expected: 1' in errors and 'Received: 0' in errors,errors\nassert int(os.environ['BASELINE_STATUS'])!=0\n(p/'oracle-result.json').write_text(json.dumps({'scope':'BASELINE ONLY; not candidate qualification','expected_failures':1,'observed_status':result['status'],'failure_signature':'composer-image expected1 received0 after tab remount'},indent=2))\nPYORACLE\n"
+        },
+        {
+          "name": "Upload diagnostic proof",
+          "if": "always()",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "thinkrail-draft-image-baseline",
+            "retention-days": 7,
+            "path": "${{ runner.temp }}/thinkrail-proof/\n${{ runner.temp }}/thinkrail/test-results/"
+          }
+        }
+      ]
+    }
+  }
+}
