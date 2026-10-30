@@ -1,249 +1,59 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
-jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+{
+  "name": "test",
+  "on": {
+    "push": {
+      "branches": [
+        "validation/thinkrail-loose-list-baseline-20261030"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "baseline": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 30,
+      "steps": [
+        {
+          "name": "Use pinned Node",
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "22.19.0"
+          }
+        },
+        {
+          "name": "Install verified official Bun1.4.4",
+          "shell": "bash",
+          "run": "set -euo pipefail\npython3 - <<'PYINSTALL'\nimport urllib.request,json,hashlib,base64,tarfile,io,pathlib,os\np=pathlib.Path(os.environ['RUNNER_TEMP'])/'bun144';p.mkdir()\nm=json.load(urllib.request.urlopen('https://registry.npmjs.org/@oven%2fbun-linux-x64/1.4.4',timeout=30))\nassert m['name']=='@oven/bun-linux-x64' and m['version']=='1.4.4'\nu=m['dist']['tarball'];assert u.startswith('https://registry.npmjs.org/')\nb=urllib.request.urlopen(u,timeout=90).read();assert 'sha512-'+base64.b64encode(hashlib.sha512(b).digest()).decode()==m['dist']['integrity']\nwith tarfile.open(fileobj=io.BytesIO(b),mode='r:gz') as t:\n matches=[x for x in t.getmembers() if x.isfile() and x.name.endswith('/bin/bun')];assert len(matches)==1\n (p/'bun').write_bytes(t.extractfile(matches[0]).read());(p/'bun').chmod(0o755)\nwith open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(p)+'\\n')\nPYINSTALL\n"
+        },
+        {
+          "name": "Fetch immutable public source and apply regression only",
+          "shell": "bash",
+          "run": "set -euo pipefail\nmkdir -p \"$RUNNER_TEMP/thinkrail\"\ncd \"$RUNNER_TEMP/thinkrail\"\ngit init -q\ngit remote add origin https://github.com/JetBrains/thinkrail.git\ngit fetch --depth=1 origin df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\ngit checkout --detach FETCH_HEAD\ntest \"$(git rev-parse HEAD)\" = \"df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\"\npython3 - <<'PYSPEC'\nimport base64,hashlib,pathlib\nb=base64.b64decode('aW1wb3J0IHsgcmVhbHBhdGhTeW5jLCBybVN5bmMsIHdyaXRlRmlsZVN5bmMgfSBmcm9tICJub2RlOmZzIjsKaW1wb3J0IHsgZXhwZWN0LCB0ZXN0IH0gZnJvbSAiQHBsYXl3cmlnaHQvdGVzdCI7CmltcG9ydCB7IGVudGVyRGVmYXVsdFdvcmtzcGFjZSwgb3BlbkZpeHR1cmVQcm9qZWN0LCBvcGVuUGVyc2lzdGVkQ2hhdCB9IGZyb20gIi4vZml4dHVyZXMvYXBwIjsKaW1wb3J0IHsgRTJFX0ZJWFRVUkVfUkVQTyB9IGZyb20gIi4vZml4dHVyZXMvcGF0aHMiOwppbXBvcnQgeyBzZWVkV29ya3NwYWNlU2Vzc2lvbiB9IGZyb20gIi4vZml4dHVyZXMvc2Vzc2lvbnMiOwoKdGVzdCgic2V0dGxlZCBsb29zZSBsaXN0IHRleHQgc3RheXMgb24gdGhlIG1hcmtlcidzIGZpcnN0IGxpbmUiLCBhc3luYyAoeyBwYWdlIH0sIHRlc3RJbmZvKSA9PiB7Cglhd2FpdCBwYWdlLnNldFZpZXdwb3J0U2l6ZSh7IHdpZHRoOiAxMjgwLCBoZWlnaHQ6IDgwMCB9KTsKCWF3YWl0IG9wZW5GaXh0dXJlUHJvamVjdChwYWdlKTsKCWNvbnN0IHNlc3Npb24gPSBzZWVkV29ya3NwYWNlU2Vzc2lvbihyZWFscGF0aFN5bmMoRTJFX0ZJWFRVUkVfUkVQTyksIHsKCQluYW1lOiAiTG9vc2UgbGlzdCBhbGlnbm1lbnQiLAoJCW1lc3NhZ2VzOiBbCgkJCXsgcm9sZTogInVzZXIiLCB0ZXh0OiAiU2hvdyB0aGUgc3RlcHMgYW5kIGNoZWNrcy4iLCB0aW1lc3RhbXA6IDFfNzAwXzcwMF8wMDBfMDAwIH0sCgkJCXsKCQkJCXJvbGU6ICJhc3Npc3RhbnQiLAoJCQkJdGV4dDogIjEuIFRpZ2h0IGNvbnRyb2wgb25lLlxuMi4gVGlnaHQgY29udHJvbCB0d28uXG5cbi0tLVxuXG4xLiBGaXJzdCBudW1iZXJlZCBzdGVwLlxuXG4gICBJdHMgZXhwbGFuYXRpb24gc3RheXMgaW4gdGhlIHNhbWUgaXRlbS5cblxuMi4gU2Vjb25kIG51bWJlcmVkIHN0ZXAuXG5cbiAgIEFub3RoZXIgZXhwbGFuYXRpb24uXG5cbi0gRmlyc3QgYnVsbGV0IGNoZWNrLlxuXG4gIEl0cyBleHBsYW5hdGlvbiBzdGF5cyBpbiB0aGUgc2FtZSBpdGVtLlxuXG4tIFNlY29uZCBidWxsZXQgY2hlY2suXG5cbiAgQW5vdGhlciBleHBsYW5hdGlvbi4iLAoJCQkJdGltZXN0YW1wOiAxXzcwMF83MDBfMDAxXzAwMCwKCQkJfSwKCQldLAoJfSk7Cgl0cnkgewoJCWF3YWl0IGVudGVyRGVmYXVsdFdvcmtzcGFjZShwYWdlKTsKCQlhd2FpdCBvcGVuUGVyc2lzdGVkQ2hhdChwYWdlLCAiTG9vc2UgbGlzdCBhbGlnbm1lbnQiKTsKCQlhd2FpdCBleHBlY3QoCgkJCXBhZ2UubG9jYXRvcihgW2RhdGEtdGVzdGlkPSJlZGl0b3ItdGFiIl1bZGF0YS1raW5kPSJjaGF0Il1bZGF0YS1zZXNzaW9uLWlkPSIke3Nlc3Npb24uaWR9Il1gKSwKCQkpLnRvQmVWaXNpYmxlKCk7CgkJY29uc3QgYW5zd2VyID0gcGFnZS5sb2NhdG9yKCdbZGF0YS10ZXN0aWQ9ImNoYXQtbWVzc2FnZSJdW2RhdGEtcm9sZT0iYXNzaXN0YW50Il0nKS5maWx0ZXIoewoJCQloYXNUZXh0OiAiRmlyc3QgbnVtYmVyZWQgc3RlcC4iLAoJCX0pOwoJCWF3YWl0IGV4cGVjdChhbnN3ZXIuZ2V0QnlUZXN0SWQoImNoYXQtY29weSIpKS50b0hhdmVDb3VudCgxKTsKCQlhd2FpdCBleHBlY3QoYW5zd2VyLmxvY2F0b3IoIm9sID4gbGkgPiBwIikuZmlyc3QoKSkudG9IYXZlVGV4dCgiRmlyc3QgbnVtYmVyZWQgc3RlcC4iKTsKCQlhd2FpdCBleHBlY3QoYW5zd2VyLmxvY2F0b3IoInVsID4gbGkgPiBwIikuZmlyc3QoKSkudG9IYXZlVGV4dCgiRmlyc3QgYnVsbGV0IGNoZWNrLiIpOwoJCWNvbnN0IGdlb21ldHJ5ID0gYXdhaXQgYW5zd2VyLmxvY2F0b3IoIm9sID4gbGksIHVsID4gbGkiKS5ldmFsdWF0ZUFsbCgoaXRlbXMpID0+CgkJCWl0ZW1zLm1hcCgoaXRlbSkgPT4gewoJCQkJY29uc3QgcGFyYWdyYXBoID0gaXRlbS5xdWVyeVNlbGVjdG9yKCI6c2NvcGUgPiBwIik7CgkJCQljb25zdCByYW5nZSA9IGRvY3VtZW50LmNyZWF0ZVJhbmdlKCk7CgkJCQlyYW5nZS5zZWxlY3ROb2RlQ29udGVudHMocGFyYWdyYXBoID8/IGl0ZW0pOwoJCQkJcmV0dXJuIHsKCQkJCQl0ZXh0OiAocGFyYWdyYXBoID8/IGl0ZW0pLnRleHRDb250ZW50LAoJCQkJCWxvb3NlOiBwYXJhZ3JhcGggIT09IG51bGwsCgkJCQkJdGV4dFRvcDogcmFuZ2UuZ2V0Q2xpZW50UmVjdHMoKVswXT8udG9wID8/IE51bWJlci5OYU4sCgkJCQkJaXRlbVRvcDogaXRlbS5nZXRCb3VuZGluZ0NsaWVudFJlY3QoKS50b3AsCgkJCQkJbGluZUhlaWdodDogTnVtYmVyLnBhcnNlRmxvYXQoZ2V0Q29tcHV0ZWRTdHlsZShpdGVtKS5saW5lSGVpZ2h0KSwKCQkJCX07CgkJCX0pLAoJCSk7CgkJd3JpdGVGaWxlU3luYyh0ZXN0SW5mby5vdXRwdXRQYXRoKCJsb29zZS1saXN0LWdlb21ldHJ5Lmpzb24iKSwgSlNPTi5zdHJpbmdpZnkoZ2VvbWV0cnksIG51bGwsIDIpKTsKCQlhd2FpdCB0ZXN0SW5mby5hdHRhY2goImxvb3NlLWxpc3QtZ2VvbWV0cnkiLCB7CgkJCWJvZHk6IEpTT04uc3RyaW5naWZ5KGdlb21ldHJ5LCBudWxsLCAyKSwKCQkJY29udGVudFR5cGU6ICJhcHBsaWNhdGlvbi9qc29uIiwKCQl9KTsKCQlleHBlY3QoZ2VvbWV0cnkpLnRvSGF2ZUxlbmd0aCg2KTsKCQljb25zdCB0aWdodCA9IGdlb21ldHJ5LmZpbHRlcigoaXRlbSkgPT4gIWl0ZW0ubG9vc2UpOwoJCWV4cGVjdCh0aWdodCkudG9IYXZlTGVuZ3RoKDIpOwoJCWZvciAoY29uc3QgaXRlbSBvZiB0aWdodCkgewoJCQlleHBlY3QoaXRlbS5saW5lSGVpZ2h0KS50b0JlR3JlYXRlclRoYW4oMCk7CgkJCWV4cGVjdChpdGVtLnRleHRUb3AgLSBpdGVtLml0ZW1Ub3AsIGB0aWdodC1saXN0LWNvbnRyb2w6ICR7aXRlbS50ZXh0fWApLnRvQmVMZXNzVGhhbigKCQkJCWl0ZW0ubGluZUhlaWdodCAvIDIsCgkJCSk7CgkJfQoJCWF3YWl0IHBhZ2Uuc2NyZWVuc2hvdCh7IHBhdGg6IHRlc3RJbmZvLm91dHB1dFBhdGgoImxvb3NlLWxpc3QtYWxpZ25tZW50LnBuZyIpIH0pOwoJCWZvciAoY29uc3QgaXRlbSBvZiBnZW9tZXRyeS5maWx0ZXIoKGl0ZW0pID0+IGl0ZW0ubG9vc2UpKSB7CgkJCWV4cGVjdChpdGVtLmxpbmVIZWlnaHQpLnRvQmVHcmVhdGVyVGhhbigwKTsKCQkJZXhwZWN0KGl0ZW0udGV4dFRvcCAtIGl0ZW0uaXRlbVRvcCwgYGxvb3NlLWxpc3QtZmlyc3QtbGluZTogJHtpdGVtLnRleHR9YCkudG9CZUxlc3NUaGFuKAoJCQkJaXRlbS5saW5lSGVpZ2h0IC8gMiwKCQkJKTsKCQl9Cgl9IGZpbmFsbHkgewoJCXJtU3luYyhzZXNzaW9uLnBhdGgsIHsgZm9yY2U6IHRydWUgfSk7Cgl9Cn0pOwo=')\nassert hashlib.sha256(b).hexdigest()=='efa256cf6edb5a816c59c4090706c57d0c5c7bc1a97ffe5551790a55ac9dc9cf'\npathlib.Path('e2e/chat-loose-list-alignment.spec.ts').write_bytes(b)\nPYSPEC\n"
+        },
+        {
+          "name": "Install exact repository dependencies and browser",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\ntest \"$(bun --version)\" = \"1.4.4\"\nbun install --frozen-lockfile\nbun x playwright install --with-deps chromium\n"
+        },
+        {
+          "name": "Require native first-line geometry failure after fixture and screenshot",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nmkdir -p \"$RUNNER_TEMP/thinkrail-proof\"\nset +e\nPLAYWRIGHT_JSON_OUTPUT_FILE=\"$RUNNER_TEMP/thinkrail-proof/baseline.json\" bun run e2e -- --serial e2e/chat-loose-list-alignment.spec.ts --retries=0 --workers=1 --reporter=json > \"$RUNNER_TEMP/thinkrail-proof/baseline.log\" 2>&1\nstatus=$?\nset -e\nexport BASELINE_EXIT=\"$status\"\npython3 - <<'PYORACLE'\nimport json,pathlib,os\nproof=pathlib.Path(os.environ['RUNNER_TEMP'])/'thinkrail-proof'\nx=json.loads((proof/'baseline.json').read_text())\nassert int(os.environ['BASELINE_EXIT'])!=0,'Baseline unexpectedly passed'\nassert not x.get('errors'),x.get('errors')\ntests=[]\ndef walk(s):\n for spec in s.get('specs',[]): tests.extend(spec.get('tests',[]))\n for child in s.get('suites',[]):walk(child)\nfor s in x.get('suites',[]):walk(s)\nassert len(tests)==1,tests\nresults=tests[0]['results'];assert len(results)==1,results\nr=results[0];assert r['status']=='failed',r\nerrors='\\n'.join(e.get('message','') for e in r.get('errors',[]))\nassert 'loose-list-first-line: First numbered step.' in errors,errors\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'thinkrail'\npngs=list((root/'test-results').rglob('loose-list-alignment.png'))\nassert len(pngs)==1,pngs\nassert pngs[0].stat().st_size>1000\ngeometries=list((root/'test-results').rglob('loose-list-geometry.json'))\nassert len(geometries)==1,geometries\ng=json.loads(geometries[0].read_text());assert len(g)==6,g\ntight=[a for a in g if not a['loose']];loose=[a for a in g if a['loose']]\nassert len(tight)==2 and len(loose)==4,g\nassert all(a['lineHeight']>0 and a['textTop']-a['itemTop']<a['lineHeight']/2 for a in tight),g\nassert loose[0]['text']=='First numbered step.' and loose[0]['textTop']-loose[0]['itemTop']>=loose[0]['lineHeight']/2,g\n(proof/'geometry.json').write_text(json.dumps(g,indent=2))\n(proof/'oracle.json').write_text(json.dumps({'result':'BASELINE_REPRODUCED','source':'df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc','failure':'loose-list-first-line geometry after seeded final answer and screenshot','png':str(pngs[0])},indent=2))\nPYORACLE\n\ngit diff --exit-code\ntest \"$(git rev-parse HEAD)\" = df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\n"
+        },
+        {
+          "name": "Upload diagnostic proof",
+          "if": "always()",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "thinkrail-loose-list-native-baseline",
+            "retention-days": 7,
+            "path": "${{ runner.temp }}/thinkrail-proof/\n${{ runner.temp }}/thinkrail/test-results/"
+          }
+        }
+      ],
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/thinkrail-loose-list-baseline-20261030' }}"
+    }
+  }
+}
