@@ -1,249 +1,109 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
-jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+{
+  "name": "test",
+  "on": {
+    "push": {
+      "branches": [
+        "validation/thinkrail-loose-list-qualified-20261030"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "qualification": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 45,
+      "steps": [
+        {
+          "name": "Use pinned Node",
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "22.19.0"
+          }
+        },
+        {
+          "name": "Install verified official Bun1.4.4",
+          "shell": "bash",
+          "run": "set -euo pipefail\npython3 - <<'PYINSTALL'\nimport urllib.request,json,hashlib,base64,tarfile,io,pathlib,os\np=pathlib.Path(os.environ['RUNNER_TEMP'])/'bun144';p.mkdir()\nm=json.load(urllib.request.urlopen('https://registry.npmjs.org/@oven%2fbun-linux-x64/1.4.4',timeout=30))\nassert m['name']=='@oven/bun-linux-x64' and m['version']=='1.4.4'\nu=m['dist']['tarball'];assert u.startswith('https://registry.npmjs.org/')\nb=urllib.request.urlopen(u,timeout=90).read();assert 'sha512-'+base64.b64encode(hashlib.sha512(b).digest()).decode()==m['dist']['integrity']\nwith tarfile.open(fileobj=io.BytesIO(b),mode='r:gz') as t:\n matches=[x for x in t.getmembers() if x.isfile() and x.name.endswith('/bin/bun')];assert len(matches)==1\n (p/'bun').write_bytes(t.extractfile(matches[0]).read());(p/'bun').chmod(0o755)\nwith open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(p)+'\\n')\nPYINSTALL\n"
+        },
+        {
+          "name": "Fetch immutable source and require exact reviewed candidate tree",
+          "shell": "bash",
+          "run": "set -euo pipefail\nmkdir -p \"$RUNNER_TEMP/thinkrail\" \"$RUNNER_TEMP/thinkrail-proof\"\ncd \"$RUNNER_TEMP/thinkrail\"\ngit init -q\ngit remote add origin https://github.com/JetBrains/thinkrail.git\ngit fetch --depth=1 origin df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\ngit checkout --detach FETCH_HEAD\ntest \"$(git rev-parse HEAD)\" = \"df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\"\npython3 - <<'PYPATCH'\nimport base64,hashlib,pathlib\nb=base64.b64decode('ZGlmZiAtLWdpdCBhL2FwcHMvd2ViL3NyYy9jaGF0L1NQRUMubWQgYi9hcHBzL3dlYi9zcmMvY2hhdC9TUEVDLm1kCmluZGV4IDA0NGFiNzYuLjQ4N2I4OTIgMTAwNjQ0Ci0tLSBhL2FwcHMvd2ViL3NyYy9jaGF0L1NQRUMubWQKKysrIGIvYXBwcy93ZWIvc3JjL2NoYXQvU1BFQy5tZApAQCAtMTgyLDcgKzE4Miw5IEBAIGJsb2NrcyBpbiBvcmRlciBpbnRvIHJvd3M7IGBDaGF0VHVyblZpZXdgIGRpc3BhdGNoZXMgb24gcm93IGtpbmQ6CiAgIFRoZSBtZXNzYWdlIGNvbnRlbnQgcmVzZXJ2ZXMgb25lIGhvcml6b250YWwgYHNpemUtMjRgIGJhbmQgb24gdGhlIGFjdGlvbidzIHNpZGUgKGBwbC0yNGAgZm9yIHRoZSBmaW5hbAogICBhc3Npc3RhbnQgTWFya2Rvd24gd3JhcHBlciwgYHByLTI0YCBmb3IgdGhlIHVzZXIgYnViYmxlKSBpbnN0ZWFkIG9mIGEgdmVydGljYWwgYmFuZCwgc28gdGV4dCBhbmQgdGhlCiAgIGxhcmdlLW1lc3NhZ2UgdG9nZ2xlIGNhbm5vdCBzaXQgYmVuZWF0aCB0aGUgaGl0IHRhcmdldC4gRmluYWwtYW5zd2VyIGxpc3QgbWFya2VycyBzdGF5IGluc2lkZSB0aGVpcgotICBjb250ZW50IGJveCByYXRoZXIgdGhhbiBwYWludGluZyBiYWNrIGludG8gdGhlIGFzc2lzdGFudCdzIGFjdGlvbiBiYW5kLiBUaGUgYXNzaXN0YW50IHdyYXBwZXIgcmVtb3ZlcworICBjb250ZW50IGJveCByYXRoZXIgdGhhbiBwYWludGluZyBiYWNrIGludG8gdGhlIGFzc2lzdGFudCdzIGFjdGlvbiBiYW5kLiBBIGxpc3QgaXRlbSdzIGZpcnN0IHBhcmFncmFwaAorICBpcyBpbmxpbmUgc28gbG9vc2UtbGlzdCB0ZXh0IHNoYXJlcyB0aGUgbWFya2VyJ3MgZmlyc3QgbGluZSAoIzUwNik7IGxhdGVyIHBhcmFncmFwaHMgYW5kIG5lc3RlZCBsaXN0cworICByZW1haW4gYmxvY2tzLiBUaGUgYXNzaXN0YW50IHdyYXBwZXIgcmVtb3ZlcwogICBvbmx5IGl0cyBmaW5hbCBNYXJrZG93biBibG9jaydzIHRyYWlsaW5nIG1hcmdpbiB0byBhbGlnbiB0aGUgYWN0aW9uIHdpdGggdGhlIGFjdHVhbCBmaW5hbCBsaW5lOwogICBpbnRlci1ibG9jayBhbmQgbGVhZGluZyBtYXJnaW5zIHN0YXkgdW5jaGFuZ2VkLiBgTWVzc2FnZVdpdGhDb3B5YCBhbHNvIGNhcnJpZXMgdGhlCiAgIGBkYXRhLXRlc3RpZD0iY2hhdC1tZXNzYWdlImAvYGRhdGEtcm9sZWAgaG9va3MgdGhlIGp1bXAvZmxhc2ggKyB0ZXN0cyByZWx5IG9uLiBgQ29weUJ1dHRvbmAgaXMgYQpkaWZmIC0tZ2l0IGEvYXBwcy93ZWIvc3JjL2NoYXQvdHVybnMudHN4IGIvYXBwcy93ZWIvc3JjL2NoYXQvdHVybnMudHN4CmluZGV4IDBiNWI3OTAuLjllNGJmMTcgMTAwNjQ0Ci0tLSBhL2FwcHMvd2ViL3NyYy9jaGF0L3R1cm5zLnRzeAorKysgYi9hcHBzL3dlYi9zcmMvY2hhdC90dXJucy50c3gKQEAgLTEyOSw3ICsxMjksNyBAQCBmdW5jdGlvbiBDaGF0VHVyblZpZXdJbXBsKHsKIAkJCQkJCWNsYXNzTmFtZT17Y24oCiAJCQkJCQkJInRyLXRleHQtcmVhZGluZyB0ZXh0LXRleHQtZGVmYXVsdCIsCiAJCQkJCQkJaXNGaW5hbEFuc3dlciAmJgotCQkJCQkJCQkidy1mdWxsIG1pbi13LTAgcGwtMjQgWyY+ZGl2Pio6bGFzdC1jaGlsZF06bWItMCBbJl9vbF06bGlzdC1pbnNpZGUgWyZfdWxdOmxpc3QtaW5zaWRlIiwKKwkJCQkJCQkJInctZnVsbCBtaW4tdy0wIHBsLTI0IFsmPmRpdj4qOmxhc3QtY2hpbGRdOm1iLTAgWyZfb2xdOmxpc3QtaW5zaWRlIFsmX3VsXTpsaXN0LWluc2lkZSBbJl9saT5wOmZpcnN0LWNoaWxkXTppbmxpbmUiLAogCQkJCQkJKX0KIAkJCQkJPgogCQkJCQkJPEFzc2lzdGFudE1hcmtkb3duCmRpZmYgLS1naXQgYS9lMmUvY2hhdC1sb29zZS1saXN0LWFsaWdubWVudC5zcGVjLnRzIGIvZTJlL2NoYXQtbG9vc2UtbGlzdC1hbGlnbm1lbnQuc3BlYy50cwpuZXcgZmlsZSBtb2RlIDEwMDY0NAppbmRleCAwMDAwMDAwLi4yZWMyYzc2Ci0tLSAvZGV2L251bGwKKysrIGIvZTJlL2NoYXQtbG9vc2UtbGlzdC1hbGlnbm1lbnQuc3BlYy50cwpAQCAtMCwwICsxLDE3NiBAQAoraW1wb3J0IHsgcmVhbHBhdGhTeW5jLCBybVN5bmMsIHdyaXRlRmlsZVN5bmMgfSBmcm9tICJub2RlOmZzIjsKK2ltcG9ydCB7IGV4cGVjdCwgdGVzdCB9IGZyb20gIkBwbGF5d3JpZ2h0L3Rlc3QiOworaW1wb3J0IHsgZW50ZXJEZWZhdWx0V29ya3NwYWNlLCBvcGVuRml4dHVyZVByb2plY3QsIG9wZW5QZXJzaXN0ZWRDaGF0IH0gZnJvbSAiLi9maXh0dXJlcy9hcHAiOworaW1wb3J0IHsgRTJFX0ZJWFRVUkVfUkVQTyB9IGZyb20gIi4vZml4dHVyZXMvcGF0aHMiOworaW1wb3J0IHsgc2VlZFdvcmtzcGFjZVNlc3Npb24gfSBmcm9tICIuL2ZpeHR1cmVzL3Nlc3Npb25zIjsKKwordGVzdCgic2V0dGxlZCBsb29zZSBsaXN0IHRleHQgc3RheXMgb24gdGhlIG1hcmtlcidzIGZpcnN0IGxpbmUiLCBhc3luYyAoeyBwYWdlIH0sIHRlc3RJbmZvKSA9PiB7CisJYXdhaXQgcGFnZS5zZXRWaWV3cG9ydFNpemUoeyB3aWR0aDogMTI4MCwgaGVpZ2h0OiA4MDAgfSk7CisJYXdhaXQgb3BlbkZpeHR1cmVQcm9qZWN0KHBhZ2UpOworCWNvbnN0IHNlc3Npb24gPSBzZWVkV29ya3NwYWNlU2Vzc2lvbihyZWFscGF0aFN5bmMoRTJFX0ZJWFRVUkVfUkVQTyksIHsKKwkJbmFtZTogIkxvb3NlIGxpc3QgYWxpZ25tZW50IiwKKwkJbWVzc2FnZXM6IFsKKwkJCXsgcm9sZTogInVzZXIiLCB0ZXh0OiAiU2hvdyB0aGUgc3RlcHMgYW5kIGNoZWNrcy4iLCB0aW1lc3RhbXA6IDFfNzAwXzcwMF8wMDBfMDAwIH0sCisJCQl7CisJCQkJcm9sZTogImFzc2lzdGFudCIsCisJCQkJdGV4dDogIjEuIFRpZ2h0IGNvbnRyb2wgb25lLlxuMi4gVGlnaHQgY29udHJvbCB0d28uXG5cbi0tLVxuXG4xLiBGaXJzdCBudW1iZXJlZCBzdGVwLlxuXG4gICBJdHMgZXhwbGFuYXRpb24gc3RheXMgaW4gdGhlIHNhbWUgaXRlbS5cblxuMi4gU2Vjb25kIG51bWJlcmVkIHN0ZXAuXG5cbiAgIEFub3RoZXIgZXhwbGFuYXRpb24uXG5cbi0gRmlyc3QgYnVsbGV0IGNoZWNrLlxuXG4gIEl0cyBleHBsYW5hdGlvbiBzdGF5cyBpbiB0aGUgc2FtZSBpdGVtLlxuXG4tIFNlY29uZCBidWxsZXQgY2hlY2suXG5cbiAgQW5vdGhlciBleHBsYW5hdGlvbi4iLAorCQkJCXRpbWVzdGFtcDogMV83MDBfNzAwXzAwMV8wMDAsCisJCQl9LAorCQldLAorCX0pOworCXRyeSB7CisJCWF3YWl0IGVudGVyRGVmYXVsdFdvcmtzcGFjZShwYWdlKTsKKwkJYXdhaXQgb3BlblBlcnNpc3RlZENoYXQocGFnZSwgIkxvb3NlIGxpc3QgYWxpZ25tZW50Iik7CisJCWF3YWl0IGV4cGVjdCgKKwkJCXBhZ2UubG9jYXRvcihgW2RhdGEtdGVzdGlkPSJlZGl0b3ItdGFiIl1bZGF0YS1raW5kPSJjaGF0Il1bZGF0YS1zZXNzaW9uLWlkPSIke3Nlc3Npb24uaWR9Il1gKSwKKwkJKS50b0JlVmlzaWJsZSgpOworCQljb25zdCBhbnN3ZXIgPSBwYWdlLmxvY2F0b3IoJ1tkYXRhLXRlc3RpZD0iY2hhdC1tZXNzYWdlIl1bZGF0YS1yb2xlPSJhc3Npc3RhbnQiXScpLmZpbHRlcih7CisJCQloYXNUZXh0OiAiRmlyc3QgbnVtYmVyZWQgc3RlcC4iLAorCQl9KTsKKwkJYXdhaXQgZXhwZWN0KGFuc3dlci5nZXRCeVRlc3RJZCgiY2hhdC1jb3B5IikpLnRvSGF2ZUNvdW50KDEpOworCQlhd2FpdCBleHBlY3QoYW5zd2VyLmxvY2F0b3IoIm9sID4gbGkgPiBwIikuZmlyc3QoKSkudG9IYXZlVGV4dCgiRmlyc3QgbnVtYmVyZWQgc3RlcC4iKTsKKwkJYXdhaXQgZXhwZWN0KGFuc3dlci5sb2NhdG9yKCJ1bCA+IGxpID4gcCIpLmZpcnN0KCkpLnRvSGF2ZVRleHQoIkZpcnN0IGJ1bGxldCBjaGVjay4iKTsKKwkJY29uc3QgZ2VvbWV0cnkgPSBhd2FpdCBhbnN3ZXIubG9jYXRvcigib2wgPiBsaSwgdWwgPiBsaSIpLmV2YWx1YXRlQWxsKChpdGVtcykgPT4KKwkJCWl0ZW1zLm1hcCgoaXRlbSkgPT4geworCQkJCWNvbnN0IHBhcmFncmFwaCA9IGl0ZW0ucXVlcnlTZWxlY3RvcigiOnNjb3BlID4gcCIpOworCQkJCWNvbnN0IHJhbmdlID0gZG9jdW1lbnQuY3JlYXRlUmFuZ2UoKTsKKwkJCQlyYW5nZS5zZWxlY3ROb2RlQ29udGVudHMocGFyYWdyYXBoID8/IGl0ZW0pOworCQkJCXJldHVybiB7CisJCQkJCXRleHQ6IChwYXJhZ3JhcGggPz8gaXRlbSkudGV4dENvbnRlbnQsCisJCQkJCWxvb3NlOiBwYXJhZ3JhcGggIT09IG51bGwsCisJCQkJCXRleHRUb3A6IHJhbmdlLmdldENsaWVudFJlY3RzKClbMF0/LnRvcCA/PyBOdW1iZXIuTmFOLAorCQkJCQlpdGVtVG9wOiBpdGVtLmdldEJvdW5kaW5nQ2xpZW50UmVjdCgpLnRvcCwKKwkJCQkJbGluZUhlaWdodDogTnVtYmVyLnBhcnNlRmxvYXQoZ2V0Q29tcHV0ZWRTdHlsZShpdGVtKS5saW5lSGVpZ2h0KSwKKwkJCQl9OworCQkJfSksCisJCSk7CisJCXdyaXRlRmlsZVN5bmMoCisJCQl0ZXN0SW5mby5vdXRwdXRQYXRoKCJsb29zZS1saXN0LWdlb21ldHJ5Lmpzb24iKSwKKwkJCUpTT04uc3RyaW5naWZ5KGdlb21ldHJ5LCBudWxsLCAyKSwKKwkJKTsKKwkJYXdhaXQgdGVzdEluZm8uYXR0YWNoKCJsb29zZS1saXN0LWdlb21ldHJ5IiwgeworCQkJYm9keTogSlNPTi5zdHJpbmdpZnkoZ2VvbWV0cnksIG51bGwsIDIpLAorCQkJY29udGVudFR5cGU6ICJhcHBsaWNhdGlvbi9qc29uIiwKKwkJfSk7CisJCWV4cGVjdChnZW9tZXRyeSkudG9IYXZlTGVuZ3RoKDYpOworCQljb25zdCB0aWdodCA9IGdlb21ldHJ5LmZpbHRlcigoaXRlbSkgPT4gIWl0ZW0ubG9vc2UpOworCQlleHBlY3QodGlnaHQpLnRvSGF2ZUxlbmd0aCgyKTsKKwkJZm9yIChjb25zdCBpdGVtIG9mIHRpZ2h0KSB7CisJCQlleHBlY3QoaXRlbS5saW5lSGVpZ2h0KS50b0JlR3JlYXRlclRoYW4oMCk7CisJCQlleHBlY3QoaXRlbS50ZXh0VG9wIC0gaXRlbS5pdGVtVG9wLCBgdGlnaHQtbGlzdC1jb250cm9sOiAke2l0ZW0udGV4dH1gKS50b0JlTGVzc1RoYW4oCisJCQkJaXRlbS5saW5lSGVpZ2h0IC8gMiwKKwkJCSk7CisJCX0KKwkJYXdhaXQgcGFnZS5zY3JlZW5zaG90KHsgcGF0aDogdGVzdEluZm8ub3V0cHV0UGF0aCgibG9vc2UtbGlzdC1hbGlnbm1lbnQucG5nIikgfSk7CisJCWZvciAoY29uc3QgaXRlbSBvZiBnZW9tZXRyeS5maWx0ZXIoKGl0ZW0pID0+IGl0ZW0ubG9vc2UpKSB7CisJCQlleHBlY3QoaXRlbS5saW5lSGVpZ2h0KS50b0JlR3JlYXRlclRoYW4oMCk7CisJCQlleHBlY3QoaXRlbS50ZXh0VG9wIC0gaXRlbS5pdGVtVG9wLCBgbG9vc2UtbGlzdC1maXJzdC1saW5lOiAke2l0ZW0udGV4dH1gKS50b0JlTGVzc1RoYW4oCisJCQkJaXRlbS5saW5lSGVpZ2h0IC8gMiwKKwkJCSk7CisJCX0KKwl9IGZpbmFsbHkgeworCQlybVN5bmMoc2Vzc2lvbi5wYXRoLCB7IGZvcmNlOiB0cnVlIH0pOworCX0KK30pOworCitmb3IgKGNvbnN0IHdpZHRoIG9mIFsxMjgwLCA5MDBdKSB7CisJdGVzdChgbG9vc2UgbGlzdHMgcHJlc2VydmUgd3JhcHBpbmcsIHBhcmFncmFwaHMsIG5lc3RpbmcgYW5kIGNvcHkgYXQgJHt3aWR0aH1weGAsIGFzeW5jICh7CisJCXBhZ2UsCisJfSwgdGVzdEluZm8pID0+IHsKKwkJYXdhaXQgcGFnZS5zZXRWaWV3cG9ydFNpemUoeyB3aWR0aCwgaGVpZ2h0OiA4MDAgfSk7CisJCWF3YWl0IHBhZ2UuY29udGV4dCgpLmdyYW50UGVybWlzc2lvbnMoWyJjbGlwYm9hcmQtcmVhZCIsICJjbGlwYm9hcmQtd3JpdGUiXSk7CisJCWF3YWl0IG9wZW5GaXh0dXJlUHJvamVjdChwYWdlKTsKKwkJY29uc3Qgd3JhcHBlZCA9CisJCQkiQSBkZWxpYmVyYXRlbHkgbG9uZyBmaXJzdCBwYXJhZ3JhcGgga2VlcHMgd3JhcHBpbmcgd2l0aGluIHRoaXMgbnVtYmVyZWQgaXRlbS4gIi5yZXBlYXQoMTIpOworCQljb25zdCBtYXJrZG93biA9IGAxLiAke3dyYXBwZWR9XG5cbiAgIExhdGVyIHBhcmFncmFwaCByZW1haW5zIHNlcGFyYXRlLlxuXG4gICAtIE5lc3RlZCBjaGlsZCBvbmUuXG5cbiAgICAgTmVzdGVkIGNoaWxkIGNvbnRpbnVhdGlvbi5cblxuICAgLSBOZXN0ZWQgY2hpbGQgdHdvLlxuXG4tLS1cblxuOTk5OTk5OTk5LiBMb25nIHRpZ2h0IG1hcmtlci5cblxuLS0tXG5cbjk5OTk5OTk5OS4gTG9uZyBsb29zZSBtYXJrZXIuXG5cbiAgICAgICAgICAgTG9uZyBsb29zZSBjb250aW51YXRpb24uYDsKKwkJY29uc3Qgc2Vzc2lvbiA9IHNlZWRXb3Jrc3BhY2VTZXNzaW9uKHJlYWxwYXRoU3luYyhFMkVfRklYVFVSRV9SRVBPKSwgeworCQkJbmFtZTogYExpc3QgYm91bmRhcmllcyAke3dpZHRofWAsCisJCQltZXNzYWdlczogWworCQkJCXsgcm9sZTogInVzZXIiLCB0ZXh0OiAiU2hvdyBsaXN0IGxheW91dCBib3VuZGFyaWVzLiIsIHRpbWVzdGFtcDogMV83MDBfNzAwXzAwMF8wMDAgfSwKKwkJCQl7IHJvbGU6ICJhc3Npc3RhbnQiLCB0ZXh0OiBtYXJrZG93biwgdGltZXN0YW1wOiAxXzcwMF83MDBfMDAxXzAwMCB9LAorCQkJXSwKKwkJfSk7CisJCXRyeSB7CisJCQlhd2FpdCBlbnRlckRlZmF1bHRXb3Jrc3BhY2UocGFnZSk7CisJCQlhd2FpdCBvcGVuUGVyc2lzdGVkQ2hhdChwYWdlLCBgTGlzdCBib3VuZGFyaWVzICR7d2lkdGh9YCk7CisJCQlhd2FpdCBleHBlY3QoCisJCQkJcGFnZS5sb2NhdG9yKAorCQkJCQlgW2RhdGEtdGVzdGlkPSJlZGl0b3ItdGFiIl1bZGF0YS1raW5kPSJjaGF0Il1bZGF0YS1zZXNzaW9uLWlkPSIke3Nlc3Npb24uaWR9Il1gLAorCQkJCSksCisJCQkpLnRvQmVWaXNpYmxlKCk7CisJCQljb25zdCBhbnN3ZXIgPSBwYWdlLmxvY2F0b3IoJ1tkYXRhLXRlc3RpZD0iY2hhdC1tZXNzYWdlIl1bZGF0YS1yb2xlPSJhc3Npc3RhbnQiXScpLmZpbHRlcih7CisJCQkJaGFzVGV4dDogIkEgZGVsaWJlcmF0ZWx5IGxvbmcgZmlyc3QgcGFyYWdyYXBoIiwKKwkJCX0pOworCQkJYXdhaXQgZXhwZWN0KGFuc3dlci5sb2NhdG9yKCJvbFtzdGFydD0nOTk5OTk5OTk5J10iKSkudG9IYXZlQ291bnQoMik7CisJCQlhd2FpdCBleHBlY3QoYW5zd2VyLmxvY2F0b3IoInVsID4gbGkgPiBwIikuZmlyc3QoKSkudG9IYXZlVGV4dCgiTmVzdGVkIGNoaWxkIG9uZS4iKTsKKwkJCWNvbnN0IGdlb21ldHJ5ID0gYXdhaXQgYW5zd2VyLmV2YWx1YXRlKChlbGVtZW50KSA9PiB7CisJCQkJY29uc3QgZmlyc3RJdGVtID0gZWxlbWVudC5xdWVyeVNlbGVjdG9yKCJvbCA+IGxpIik7CisJCQkJY29uc3QgZmlyc3QgPSBmaXJzdEl0ZW0/LnF1ZXJ5U2VsZWN0b3IoIjpzY29wZSA+IHA6Zmlyc3QtY2hpbGQiKTsKKwkJCQljb25zdCBsYXRlciA9IGZpcnN0SXRlbT8ucXVlcnlTZWxlY3RvcigiOnNjb3BlID4gcDpudGgtY2hpbGQoMikiKTsKKwkJCQljb25zdCBuZXN0ZWQgPSBmaXJzdEl0ZW0/LnF1ZXJ5U2VsZWN0b3IoIjpzY29wZSA+IHVsIik7CisJCQkJY29uc3QgbmVzdGVkSXRlbSA9IG5lc3RlZD8ucXVlcnlTZWxlY3RvcigibGkiKTsKKwkJCQljb25zdCBuZXN0ZWRGaXJzdCA9IG5lc3RlZEl0ZW0/LnF1ZXJ5U2VsZWN0b3IoIjpzY29wZSA+IHAiKTsKKwkJCQlpZiAoIWZpcnN0SXRlbSB8fCAhZmlyc3QgfHwgIWxhdGVyIHx8ICFuZXN0ZWQgfHwgIW5lc3RlZEl0ZW0gfHwgIW5lc3RlZEZpcnN0KSB7CisJCQkJCXRocm93IG5ldyBFcnJvcigKKwkJCQkJCSJUaGUgZml4dHVyZSBtdXN0IHJldGFpbiBpdHMgd3JhcHBlZCBwYXJhZ3JhcGgsIGxhdGVyIHBhcmFncmFwaCBhbmQgbmVzdGVkIGxpc3QiLAorCQkJCQkpOworCQkJCX0KKwkJCQljb25zdCB0ZXh0UmVjdHMgPSAobm9kZTogTm9kZSkgPT4geworCQkJCQljb25zdCByYW5nZSA9IGRvY3VtZW50LmNyZWF0ZVJhbmdlKCk7CisJCQkJCXJhbmdlLnNlbGVjdE5vZGVDb250ZW50cyhub2RlKTsKKwkJCQkJcmV0dXJuIFsuLi5yYW5nZS5nZXRDbGllbnRSZWN0cygpXS5tYXAoKHJlY3QpID0+ICh7CisJCQkJCQl0b3A6IHJlY3QudG9wLAorCQkJCQkJYm90dG9tOiByZWN0LmJvdHRvbSwKKwkJCQkJfSkpOworCQkJCX07CisJCQkJcmV0dXJuIHsKKwkJCQkJZmlyc3RMaW5lczogdGV4dFJlY3RzKGZpcnN0KSwKKwkJCQkJaXRlbVRvcDogZmlyc3RJdGVtLmdldEJvdW5kaW5nQ2xpZW50UmVjdCgpLnRvcCwKKwkJCQkJbGluZUhlaWdodDogTnVtYmVyLnBhcnNlRmxvYXQoZ2V0Q29tcHV0ZWRTdHlsZShmaXJzdEl0ZW0pLmxpbmVIZWlnaHQpLAorCQkJCQlsYXRlclRvcDogbGF0ZXIuZ2V0Qm91bmRpbmdDbGllbnRSZWN0KCkudG9wLAorCQkJCQlsYXRlckJvdHRvbTogbGF0ZXIuZ2V0Qm91bmRpbmdDbGllbnRSZWN0KCkuYm90dG9tLAorCQkJCQluZXN0ZWRUb3A6IG5lc3RlZC5nZXRCb3VuZGluZ0NsaWVudFJlY3QoKS50b3AsCisJCQkJCW5lc3RlZEdseXBoVG9wOiB0ZXh0UmVjdHMobmVzdGVkRmlyc3QpWzBdPy50b3AgPz8gTnVtYmVyLk5hTiwKKwkJCQkJbmVzdGVkSXRlbVRvcDogbmVzdGVkSXRlbS5nZXRCb3VuZGluZ0NsaWVudFJlY3QoKS50b3AsCisJCQkJCW5lc3RlZExpbmVIZWlnaHQ6IE51bWJlci5wYXJzZUZsb2F0KGdldENvbXB1dGVkU3R5bGUobmVzdGVkSXRlbSkubGluZUhlaWdodCksCisJCQkJCWxvbmdNYXJrZXJzOiBbLi4uZWxlbWVudC5xdWVyeVNlbGVjdG9yQWxsKCJvbFtzdGFydD0nOTk5OTk5OTk5J10gPiBsaSIpXS5tYXAoKGl0ZW0pID0+IHsKKwkJCQkJCWNvbnN0IGNvbnRlbnQgPSBpdGVtLnF1ZXJ5U2VsZWN0b3IoIjpzY29wZSA+IHAiKSA/PyBpdGVtOworCQkJCQkJcmV0dXJuIHsKKwkJCQkJCQl0ZXh0VG9wOiB0ZXh0UmVjdHMoY29udGVudClbMF0/LnRvcCA/PyBOdW1iZXIuTmFOLAorCQkJCQkJCWl0ZW1Ub3A6IGl0ZW0uZ2V0Qm91bmRpbmdDbGllbnRSZWN0KCkudG9wLAorCQkJCQkJCWxpbmVIZWlnaHQ6IE51bWJlci5wYXJzZUZsb2F0KGdldENvbXB1dGVkU3R5bGUoaXRlbSkubGluZUhlaWdodCksCisJCQkJCQl9OworCQkJCQl9KSwKKwkJCQl9OworCQkJfSk7CisJCQl3cml0ZUZpbGVTeW5jKAorCQkJCXRlc3RJbmZvLm91dHB1dFBhdGgoImxpc3QtYm91bmRhcnktZ2VvbWV0cnkuanNvbiIpLAorCQkJCUpTT04uc3RyaW5naWZ5KGdlb21ldHJ5LCBudWxsLCAyKSwKKwkJCSk7CisJCQlleHBlY3QoZ2VvbWV0cnkuZmlyc3RMaW5lcy5sZW5ndGgpLnRvQmVHcmVhdGVyVGhhbigxKTsKKwkJCWV4cGVjdChnZW9tZXRyeS5maXJzdExpbmVzWzBdPy50b3AgPz8gTnVtYmVyLk5hTikudG9CZUxlc3NUaGFuKAorCQkJCWdlb21ldHJ5Lml0ZW1Ub3AgKyBnZW9tZXRyeS5saW5lSGVpZ2h0IC8gMiwKKwkJCSk7CisJCQlleHBlY3QoZ2VvbWV0cnkubGF0ZXJUb3ApLnRvQmVHcmVhdGVyVGhhbihnZW9tZXRyeS5maXJzdExpbmVzLmF0KC0xKT8uYm90dG9tID8/IE51bWJlci5OYU4pOworCQkJZXhwZWN0KGdlb21ldHJ5Lm5lc3RlZFRvcCkudG9CZUdyZWF0ZXJUaGFuT3JFcXVhbChnZW9tZXRyeS5sYXRlckJvdHRvbSk7CisJCQlleHBlY3QoZ2VvbWV0cnkubmVzdGVkR2x5cGhUb3AgLSBnZW9tZXRyeS5uZXN0ZWRJdGVtVG9wKS50b0JlTGVzc1RoYW4oCisJCQkJZ2VvbWV0cnkubmVzdGVkTGluZUhlaWdodCAvIDIsCisJCQkpOworCQkJZm9yIChjb25zdCBpdGVtIG9mIGdlb21ldHJ5LmxvbmdNYXJrZXJzKSB7CisJCQkJZXhwZWN0KGl0ZW0ubGluZUhlaWdodCkudG9CZUdyZWF0ZXJUaGFuKDApOworCQkJCWV4cGVjdChpdGVtLnRleHRUb3AgLSBpdGVtLml0ZW1Ub3ApLnRvQmVMZXNzVGhhbihpdGVtLmxpbmVIZWlnaHQgLyAyKTsKKwkJCX0KKwkJCWF3YWl0IGFuc3dlci5sb2NhdG9yKCJvbCA+IGxpID4gcCIpLmZpcnN0KCkuc2Nyb2xsSW50b1ZpZXdJZk5lZWRlZCgpOworCQkJYXdhaXQgcGFnZS5zY3JlZW5zaG90KHsgcGF0aDogdGVzdEluZm8ub3V0cHV0UGF0aChgbGlzdC13cmFwcGluZy0ke3dpZHRofS5wbmdgKSB9KTsKKwkJCWF3YWl0IGFuc3dlci5nZXRCeVRlc3RJZCgiY2hhdC1jb3B5Iikuc2Nyb2xsSW50b1ZpZXdJZk5lZWRlZCgpOworCQkJYXdhaXQgYW5zd2VyLmdldEJ5VGVzdElkKCJjaGF0LWNvcHkiKS5ob3ZlcigpOworCQkJYXdhaXQgcGFnZS5zY3JlZW5zaG90KHsgcGF0aDogdGVzdEluZm8ub3V0cHV0UGF0aChgbGlzdC1ib3VuZGFyaWVzLSR7d2lkdGh9LnBuZ2ApIH0pOworCQkJYXdhaXQgYW5zd2VyLmdldEJ5VGVzdElkKCJjaGF0LWNvcHkiKS5jbGljaygpOworCQkJYXdhaXQgZXhwZWN0KGFzeW5jICgpID0+IHsKKwkJCQlleHBlY3QoYXdhaXQgcGFnZS5ldmFsdWF0ZSgoKSA9PiBuYXZpZ2F0b3IuY2xpcGJvYXJkLnJlYWRUZXh0KCkpKS50b0JlKG1hcmtkb3duKTsKKwkJCX0pLnRvUGFzcygpOworCQl9IGZpbmFsbHkgeworCQkJcm1TeW5jKHNlc3Npb24ucGF0aCwgeyBmb3JjZTogdHJ1ZSB9KTsKKwkJfQorCX0pOworfQo=')\nassert hashlib.sha256(b).hexdigest()=='5ad2c5f90807fa6e4faa5bd94bade17349a76ecbaa35baf34bbffccb0232839b'\npathlib.Path('/tmp/thinkrail-candidate.patch').write_bytes(b)\nPYPATCH\ngit apply --check /tmp/thinkrail-candidate.patch\ngit apply /tmp/thinkrail-candidate.patch\ngit diff --check\ngit add --all\ntest \"$(git write-tree)\" = \"0ed31a05ce8a1594fce6741a452e06ddb3d16262\"\n"
+        },
+        {
+          "name": "Install frozen repository dependencies and matching browser",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\ntest \"$(bun --version)\" = \"1.4.4\"\nbun install --frozen-lockfile\nbun x playwright install --with-deps chromium\n"
+        },
+        {
+          "name": "Required check:deps",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run check:deps > \"$RUNNER_TEMP/thinkrail-proof/check-deps.log\" 2>&1\n"
+        },
+        {
+          "name": "Required check:boundaries",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run check:boundaries > \"$RUNNER_TEMP/thinkrail-proof/check-boundaries.log\" 2>&1\n"
+        },
+        {
+          "name": "Required check:seams",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run check:seams > \"$RUNNER_TEMP/thinkrail-proof/check-seams.log\" 2>&1\n"
+        },
+        {
+          "name": "Required lint",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run lint > \"$RUNNER_TEMP/thinkrail-proof/lint.log\" 2>&1\n"
+        },
+        {
+          "name": "Required typecheck",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run typecheck > \"$RUNNER_TEMP/thinkrail-proof/typecheck.log\" 2>&1\n"
+        },
+        {
+          "name": "Required check:spec-surface",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run check:spec-surface > \"$RUNNER_TEMP/thinkrail-proof/check-spec-surface.log\" 2>&1\n"
+        },
+        {
+          "name": "Required check:compiler",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run check:compiler > \"$RUNNER_TEMP/thinkrail-proof/check-compiler.log\" 2>&1\n"
+        },
+        {
+          "name": "Required test",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nbun run test > \"$RUNNER_TEMP/thinkrail-proof/test.log\" 2>&1\n"
+        },
+        {
+          "name": "Require native loose-list geometry and tight-list controls",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nPLAYWRIGHT_JSON_OUTPUT_FILE=\"$RUNNER_TEMP/thinkrail-proof/focused.json\" bun run e2e -- --serial e2e/chat-loose-list-alignment.spec.ts --retries=0 --workers=1 --reporter=json > \"$RUNNER_TEMP/thinkrail-proof/focused.log\" 2>&1\npython3 - <<'PYORACLE'\nimport json,pathlib,os\nroot=pathlib.Path(os.environ['RUNNER_TEMP'])/'thinkrail'\nproof=pathlib.Path(os.environ['RUNNER_TEMP'])/'thinkrail-proof'\nx=json.loads((proof/'focused.json').read_text());assert not x.get('errors'),x.get('errors')\nspecs=[]\ndef walk(s):\n specs.extend(s.get('specs',[]))\n for child in s.get('suites',[]):walk(child)\nfor s in x.get('suites',[]):walk(s)\nexpected={\"settled loose list text stays on the marker's first line\", \"loose lists preserve wrapping, paragraphs, nesting and copy at 1280px\", \"loose lists preserve wrapping, paragraphs, nesting and copy at 900px\"}\nassert len(specs)==3 and {s['title'] for s in specs}==expected,specs\nfor s in specs:\n assert len(s['tests'])==1,s\n r=s['tests'][0]['results'];assert len(r)==1 and r[0]['status']=='passed',r\npngs=list((root/'test-results').rglob('loose-list-alignment.png'));assert len(pngs)==1,pngs\ngeometries=list((root/'test-results').rglob('loose-list-geometry.json'));assert len(geometries)==1,geometries\ng=json.loads(geometries[0].read_text());assert len(g)==6,g\nassert sum(a['loose'] for a in g)==4,g\nassert all(a['lineHeight']>0 and a['textTop']-a['itemTop']<a['lineHeight']/2 for a in g),g\n(proof/'loose-list-alignment.png').write_bytes(pngs[0].read_bytes())\n(proof/'focused-geometry.json').write_text(json.dumps(g,indent=2))\nboundaries=list((root/'test-results').rglob('list-boundary-geometry.json'));assert len(boundaries)==2,boundaries\nfor i,path in enumerate(boundaries):\n g=json.loads(path.read_text());lines=g['firstLines'];assert len(lines)>1,g\n assert lines[0]['top']<g['itemTop']+g['lineHeight']/2,g\n assert g['laterTop']>lines[-1]['bottom'],g\n assert g['nestedTop']>=g['laterBottom'],g\n assert g['nestedGlyphTop']-g['nestedItemTop']<g['nestedLineHeight']/2,g\n assert len(g['longMarkers'])==2 and all(a['textTop']-a['itemTop']<a['lineHeight']/2 for a in g['longMarkers']),g\n (proof/f'boundary-geometry-{i}.json').write_text(json.dumps(g,indent=2))\nfor width in (1280,900):\n for name in (f'list-wrapping-{width}.png',f'list-boundaries-{width}.png'):\n  shots=list((root/'test-results').rglob(name));assert len(shots)==1,shots\n  (proof/name).write_bytes(shots[0].read_bytes())\n(proof/'focused-pass.json').write_text(json.dumps({'status':'PASS','tests':3,'viewport':'1280x800','controls':'2 tight,4 loose first lines','png':str(pngs[0])},indent=2))\nPYORACLE\n"
+        },
+        {
+          "name": "Required complete no-agent browser suite once after implementation",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\nTHINKRAIL_E2E_SKIP_BUILD=1 bun run e2e > \"$RUNNER_TEMP/thinkrail-proof/full-e2e.log\" 2>&1\n"
+        },
+        {
+          "name": "Require unchanged reviewed source after all checks",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\ngit diff --exit-code\ntest -z \"$(git ls-files --others --exclude-standard)\"\ntest \"$(git write-tree)\" = \"0ed31a05ce8a1594fce6741a452e06ddb3d16262\"\ngit diff --cached --check\nprintf \"%s\\n\" \"df7cb6d2dd5fafbc6ed8eea721f16e54f09e38fc\" \"0ed31a05ce8a1594fce6741a452e06ddb3d16262\" > \"$RUNNER_TEMP/thinkrail-proof/exact-source.txt\"\n"
+        },
+        {
+          "name": "Upload verification evidence",
+          "if": "always()",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "thinkrail-loose-list-candidate-qualification",
+            "retention-days": 7,
+            "path": "${{ runner.temp }}/thinkrail-proof/\n${{ runner.temp }}/thinkrail/test-results/\n${{ runner.temp }}/thinkrail/playwright-report/"
+          }
+        }
+      ],
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/thinkrail-loose-list-qualified-20261030' }}"
+    }
+  }
+}
