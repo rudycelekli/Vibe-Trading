@@ -88,7 +88,7 @@
           }
         }
       ],
-      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/claude-mem-list-fence-repair-qualified-20261030' }}"
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/additional20-search-20261030' }}"
     },
     "core": {
       "name": "Core upstream Linux gates \u00b7 full lanes \u00b7 source guards",
@@ -198,7 +198,7 @@
           }
         }
       ],
-      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/claude-mem-list-fence-repair-qualified-20261030' }}"
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/additional20-search-20261030' }}"
     },
     "packaging": {
       "name": "Committed plugin freeze \u00b7 clean-room \u00b7 Linux media slice",
@@ -280,7 +280,7 @@
           }
         }
       ],
-      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/claude-mem-list-fence-repair-qualified-20261030' }}"
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/additional20-search-20261030' }}"
     }
   }
 }
