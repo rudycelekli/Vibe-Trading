@@ -1,249 +1,72 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
-jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+{
+  "name": "OpenBot authorization audit baseline only",
+  "on": {
+    "push": {
+      "branches": [
+        "validation/openbot-authorization-audit-baseline-20261030"
+      ]
+    },
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "baseline": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 20,
+      "services": {
+        "postgres": {
+          "image": "pgvector/pgvector:pg17",
+          "env": {
+            "POSTGRES_DB": "openbot_test",
+            "POSTGRES_USER": "openbot",
+            "POSTGRES_PASSWORD": "openbot"
+          },
+          "ports": [
+            "5432:5432"
+          ],
+          "options": "--health-cmd \"pg_isready -U openbot -d openbot_test\" --health-interval 5s --health-timeout 5s --health-retries 10"
+        }
+      },
+      "env": {
+        "DATABASE_URL": "postgres://openbot:openbot@localhost:5432/openbot_test",
+        "TEST_DATABASE_URL": "postgres://openbot:openbot@localhost:5432/openbot_test"
+      },
+      "steps": [
+        {
+          "name": "Use pinned Node",
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "22.19.0"
+          }
+        },
+        {
+          "name": "Install verified official Bun1.4.3",
+          "shell": "bash",
+          "run": "set -euo pipefail\npython3 - <<'PYINSTALL'\nimport urllib.request,json,hashlib,base64,tarfile,io,pathlib,os\np=pathlib.Path(os.environ['RUNNER_TEMP'])/'bun143';p.mkdir()\nm=json.load(urllib.request.urlopen('https://registry.npmjs.org/@oven%2fbun-linux-x64/1.4.3',timeout=30))\nassert m['name']=='@oven/bun-linux-x64' and m['version']=='1.4.3'\nu=m['dist']['tarball'];assert u.startswith('https://registry.npmjs.org/')\nb=urllib.request.urlopen(u,timeout=90).read();assert 'sha512-'+base64.b64encode(hashlib.sha512(b).digest()).decode()==m['dist']['integrity']\nwith tarfile.open(fileobj=io.BytesIO(b),mode='r:gz') as t:\n matches=[x for x in t.getmembers() if x.isfile() and x.name.endswith('/bin/bun')];assert len(matches)==1\n (p/'bun').write_bytes(t.extractfile(matches[0]).read());(p/'bun').chmod(0o755)\nwith open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(p)+'\\n')\nPYINSTALL\n"
+        },
+        {
+          "name": "Fetch immutable source, apply maintained regression only and migrate disposable DB",
+          "shell": "bash",
+          "run": "set -euo pipefail\nmkdir -p \"$RUNNER_TEMP/openbot\" \"$RUNNER_TEMP/audit-proof\"\ncd \"$RUNNER_TEMP/openbot\"\ngit init -q\ngit remote add origin https://github.com/CopilotKit/OpenBot.git\ngit fetch --depth=1 origin ab9855c19848378c90a806426130d86699cc798c\ngit checkout --detach FETCH_HEAD\ntest \"$(git rev-parse HEAD)\" = \"ab9855c19848378c90a806426130d86699cc798c\"\npython3 - <<'PYPATCH'\nimport base64,hashlib,pathlib\nb=base64.b64decode('ZGlmZiAtLWdpdCBhL3NlcnZlci90ZXN0cy9hcmNhZGUtY29tcGxldGlvbi10cmFuc2FjdGlvbi5pbnRlZ3JhdGlvbi50ZXN0LnRzIGIvc2VydmVyL3Rlc3RzL2FyY2FkZS1jb21wbGV0aW9uLXRyYW5zYWN0aW9uLmludGVncmF0aW9uLnRlc3QudHMKaW5kZXggNTUzYjIzNi4uYTM4YjM2YiAxMDA2NDQKLS0tIGEvc2VydmVyL3Rlc3RzL2FyY2FkZS1jb21wbGV0aW9uLXRyYW5zYWN0aW9uLmludGVncmF0aW9uLnRlc3QudHMKKysrIGIvc2VydmVyL3Rlc3RzL2FyY2FkZS1jb21wbGV0aW9uLXRyYW5zYWN0aW9uLmludGVncmF0aW9uLnRlc3QudHMKQEAgLTU3MywzICs1NzMsNjcgQEAgZGVzY3JpYmUoImZhaWxBdXRob3JpemF0aW9uQXR0ZW1wdCAvIG1hcmtBdXRob3JpemF0aW9uVW5yZWNvbmNpbGVkIiwgKCkgPT4gewogICAgIGV4cGVjdChbd2l0aGRyZXcsIHVucmVjb25jaWxlZF0pLnRvRXF1YWwoW2ZhbHNlLCBmYWxzZV0pOwogICB9KTsKIH0pOworCisKK2Rlc2NyaWJlKCJ1bnJlY29uY2lsZWQgYXV0aG9yaXphdGlvbiBhdWRpdCIsICgpID0+IHsKKyAgY29uc3QgZXZlbnRzRm9yID0gYXN5bmMgKGFjdG9ySWQ6IHN0cmluZykgPT4geworICAgIGNvbnN0IHJvd3MgPSBhd2FpdCBkYXRhYmFzZS5zZWxlY3QoKS5mcm9tKGF1ZGl0RXZlbnRzKS53aGVyZShhbmQoCisgICAgICBlcShhdWRpdEV2ZW50cy5ldmVudFR5cGUsICJtY3AuYXV0aG9yaXphdGlvbl91bnJlY29uY2lsZWQiKSwKKyAgICAgIGVxKGF1ZGl0RXZlbnRzLnRhcmdldElkLCBzZXJ2ZXJJZCksCisgICAgKSk7CisgICAgcmV0dXJuIHJvd3MuZmlsdGVyKChyb3cpID0+IHJvdy5wYXlsb2FkLmFjdG9yID09PSBhY3RvcklkKTsKKyAgfTsKKworICB0ZXN0KCJ1bnJlY29uY2lsZWQgYXVkaXQ6IHBlcnNpc3RzIGEgc2FmZSBldmVudCBjb3JyZWxhdGVkIHdpdGggdGhlIGNsb3NlZCBhdHRlbXB0IiwgYXN5bmMgKCkgPT4geworICAgIGNvbnN0IGEgPSBhd2FpdCBhY3RvcigiYXVkaXQtdW5yZWNvbmNpbGVkIik7CisgICAgY29uc3QgYXV0aElkID0gImFyX211c3Rfbm90X3JlYWNoX3RoZV9hdWRpdF9wYXlsb2FkIjsKKyAgICBjb25zdCBhdHRlbXB0ID0gYXdhaXQgYXR0ZW1wdFdpdGgoYSwgYXV0aElkKTsKKyAgICBleHBlY3QoYXdhaXQgc3RvcmUubWFya0F1dGhvcml6YXRpb25VbnJlY29uY2lsZWQoeyBhY3RvcklkOiBhLCBhdXRoSWQgfSkpLnRvQmUodHJ1ZSk7CisgICAgY29uc3QgZXZlbnRzID0gYXdhaXQgZXZlbnRzRm9yKGEpOworICAgIGV4cGVjdChldmVudHMpLnRvSGF2ZUxlbmd0aCgxKTsKKyAgICBleHBlY3QoZXZlbnRzWzBdPy5wYXlsb2FkKS50b0VxdWFsKHsKKyAgICAgIGFjdG9yOiBhLAorICAgICAgc2VydmVyOiBudWxsLAorICAgICAgc2VydmVySWQsCisgICAgICBhY3Rpb246ICJHb29nbGUuU2VuZEVtYWlsIiwKKyAgICAgIGhvbGRlcjogInBlcnNvbiIsCisgICAgICBhdHRlbXB0U3RhcnRlZEF0OiBhdHRlbXB0LmNyZWF0ZWRBdC50b0lTT1N0cmluZygpLAorICAgICAgb3V0Y29tZTogInVucmVjb25jaWxlZCIsCisgICAgfSk7CisgICAgZXhwZWN0KEpTT04uc3RyaW5naWZ5KGV2ZW50cykpLm5vdC50b0NvbnRhaW4oYXV0aElkKTsKKyAgICBleHBlY3QoKGF3YWl0IGF0dGVtcHRSb3coYSkpLm91dGNvbWUpLnRvQmUoInVucmVjb25jaWxlZCIpOworICB9KTsKKworICB0ZXN0KCJ1bnJlY29uY2lsZWQgYXVkaXQ6IHR3byBjb25jdXJyZW50IHRlcm1pbmFsIGNhbGxiYWNrcyByZWNvcmQgb25lIGV2ZW50IiwgYXN5bmMgKCkgPT4geworICAgIGNvbnN0IGEgPSBhd2FpdCBhY3RvcigiYXVkaXQtY29uY3VycmVudCIpOworICAgIGNvbnN0IGF1dGhJZCA9ICJhcl9jb25jdXJyZW50X3VucmVjb25jaWxlZCI7CisgICAgYXdhaXQgYXR0ZW1wdFdpdGgoYSwgYXV0aElkKTsKKyAgICBjb25zdCBvdXRjb21lcyA9IGF3YWl0IFByb21pc2UuYWxsKFsKKyAgICAgIHN0b3JlLm1hcmtBdXRob3JpemF0aW9uVW5yZWNvbmNpbGVkKHsgYWN0b3JJZDogYSwgYXV0aElkIH0pLAorICAgICAgc3RvcmUubWFya0F1dGhvcml6YXRpb25VbnJlY29uY2lsZWQoeyBhY3RvcklkOiBhLCBhdXRoSWQgfSksCisgICAgXSk7CisgICAgZXhwZWN0KG91dGNvbWVzLnNvcnQoKSkudG9FcXVhbChbZmFsc2UsIHRydWVdKTsKKyAgICBleHBlY3QoYXdhaXQgZXZlbnRzRm9yKGEpKS50b0hhdmVMZW5ndGgoMSk7CisgIH0pOworCisgIHRlc3QoInVucmVjb25jaWxlZCBhdWRpdDogYW4gYXVkaXQgaW5zZXJ0IGZhaWx1cmUgbGVhdmVzIHRoZSBhdHRlbXB0IHVuc2V0dGxlZCIsIGFzeW5jICgpID0+IHsKKyAgICBjb25zdCBhID0gYXdhaXQgYWN0b3IoImF1ZGl0LXJvbGxiYWNrIik7CisgICAgY29uc3QgYXV0aElkID0gImFyX3JvbGxiYWNrX3VucmVjb25jaWxlZCI7CisgICAgYXdhaXQgYXR0ZW1wdFdpdGgoYSwgYXV0aElkKTsKKyAgICBhd2FpdCBleHBlY3QoYnJva2VuQXVkaXRTdG9yZS5tYXJrQXV0aG9yaXphdGlvblVucmVjb25jaWxlZCh7IGFjdG9ySWQ6IGEsIGF1dGhJZCB9KSkucmVqZWN0cy50b1Rocm93KCJpbmplY3RlZCBhdWRpdCBmYWlsdXJlIik7CisgICAgY29uc3QgYWZ0ZXIgPSBhd2FpdCBhdHRlbXB0Um93KGEpOworICAgIGV4cGVjdChhZnRlci5jb21wbGV0ZWRBdCkudG9CZU51bGwoKTsKKyAgICBleHBlY3QoYWZ0ZXIub3V0Y29tZSkudG9CZU51bGwoKTsKKyAgICBleHBlY3QoYXdhaXQgZXZlbnRzRm9yKGEpKS50b0hhdmVMZW5ndGgoMCk7CisgIH0pOworCisgIHRlc3QoInVucmVjb25jaWxlZCBhdWRpdDogYSBwcmV2aW91c2x5IHNldHRsZWQgYXR0ZW1wdCBlbWl0cyBubyBmYWxzZSBldmVudCIsIGFzeW5jICgpID0+IHsKKyAgICBjb25zdCBhID0gYXdhaXQgYWN0b3IoImF1ZGl0LWFscmVhZHktc2V0dGxlZCIpOworICAgIGNvbnN0IGF1dGhJZCA9ICJhcl9hbHJlYWR5X2ZhaWxlZCI7CisgICAgYXdhaXQgYXR0ZW1wdFdpdGgoYSwgYXV0aElkKTsKKyAgICBleHBlY3QoYXdhaXQgc3RvcmUuZmFpbEF1dGhvcml6YXRpb25BdHRlbXB0KHsgYWN0b3JJZDogYSwgYXV0aElkIH0pKS50b0JlKHRydWUpOworICAgIGV4cGVjdChhd2FpdCBzdG9yZS5tYXJrQXV0aG9yaXphdGlvblVucmVjb25jaWxlZCh7IGFjdG9ySWQ6IGEsIGF1dGhJZCB9KSkudG9CZShmYWxzZSk7CisgICAgZXhwZWN0KGF3YWl0IGV2ZW50c0ZvcihhKSkudG9IYXZlTGVuZ3RoKDApOworICAgIGV4cGVjdCgoYXdhaXQgYXR0ZW1wdFJvdyhhKSkub3V0Y29tZSkudG9CZSgiZmFpbGVkIik7CisgIH0pOworfSk7Cg==')\nassert hashlib.sha256(b).hexdigest()=='3f0fa58c648bc04a38a12607952f5667ca75ed8b71577dfe6a277b4947cdb915'\npathlib.Path('/tmp/authorization-audit-regression.patch').write_bytes(b)\nPYPATCH\ngit apply --check /tmp/authorization-audit-regression.patch\ngit apply /tmp/authorization-audit-regression.patch\ngit diff --check\nbun install --frozen-lockfile\ncd server\nbun scripts/migrate.ts\n"
+        },
+        {
+          "name": "Require three native missing-audit failures and passing terminal-state control",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/openbot\"\nset +e\nbun test server/tests/arcade-completion-transaction.integration.test.ts -t 'unreconciled audit:' --reporter=junit --reporter-outfile \"$RUNNER_TEMP/audit-proof/baseline.xml\" > \"$RUNNER_TEMP/audit-proof/baseline.log\" 2>&1\nstatus=$?\nset -e\nexport BASELINE_STATUS=\"$status\"\npython3 - <<'PYORACLE'\nimport os,pathlib,xml.etree.ElementTree as ET,json\np=pathlib.Path(os.environ['RUNNER_TEMP'])/'audit-proof'\nroot=ET.parse(p/'baseline.xml').getroot()\nall_cases=list(root.iter('testcase'))\ncases=[x for x in all_cases if 'unreconciled audit:' in x.get('name','')]\nassert len(cases)==4,[(x.get('name'),x.attrib) for x in all_cases]\nexpected=['persists a safe event','two concurrent terminal','an audit insert failure']\nfailed=[x for x in cases if x.find('failure') is not None or x.find('error') is not None]\nassert len(failed)==3,[x.get('name') for x in failed]\nfor name in expected:assert any(name in x.get('name','') for x in failed),name\nassert not any(x.find('skipped') is not None for x in cases)\nassert not any((x.find('failure') is not None or x.find('error') is not None) for x in all_cases if x not in cases)\nassert int(os.environ['BASELINE_STATUS'])!=0\n(p/'oracle-result.json').write_text(json.dumps({'scope':'BASELINE ONLY; not candidate qualification','expected_failures':3,'failed_cases':[x.get('name') for x in failed],'passed_control':'previously settled attempt emits no false event'},indent=2))\nPYORACLE\n# Dependencies and migrations may not change the production source under test.\ngit diff --exit-code -- server/src shared toolkit src 2>/dev/null\ngit diff --check\n"
+        },
+        {
+          "name": "Upload native proof",
+          "if": "always()",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "openbot-authorization-audit-baseline",
+            "retention-days": 7,
+            "path": "${{ runner.temp }}/audit-proof/"
+          }
+        }
+      ]
+    }
+  }
+}
