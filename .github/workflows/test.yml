@@ -36,7 +36,7 @@
         {
           "name": "Install exact repository dependencies and browser",
           "shell": "bash",
-          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\ntest \"$(bun --version)\" = \"1.4.4\"\nbun install --frozen-lockfile\nbunx playwright install --with-deps chromium\n"
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/thinkrail\"\ntest \"$(bun --version)\" = \"1.4.4\"\nbun install --frozen-lockfile\nbun x playwright install --with-deps chromium\n"
         },
         {
           "name": "Require the native pre-fix failure signature",
