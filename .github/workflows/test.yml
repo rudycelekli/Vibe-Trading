@@ -1,249 +1,61 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger. On 2026-08-06 twelve commits landed on main without a
-  # single push-event run being created, and there was then no way to get a
-  # verdict on main short of pushing an empty commit.
-  workflow_dispatch:
-
-# `npm ci` runs a security audit after installing and blocks on the response.
-# npmjs.com's advisory endpoint is currently answering 503 (it prints "This
-# endpoint is being retired"), so npm retries it: on 2026-09-04 that turned a
-# 4s install into a 6m one and timed the CI job out mid-install. Measured on one
-# machine, one lock file, one warm cache:
-#
-#   npm ci                                    61s
-#   npm ci --no-audit --no-fund                4s
-#   NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false npm ci    4s
-#
-# Nothing is lost. `npm ci` exits 0 whatever the audit says (verified directly),
-# the endpoint returns no advisories at all right now, and Dependabot already
-# watches this same tree — it is what reported the 7 open npm alerts. This is CI
-# only; a developer's `npm ci` still audits when the endpoint recovers.
-env:
-  NPM_CONFIG_AUDIT: "false"
-  NPM_CONFIG_FUND: "false"
-
-jobs:
-  hash-lock:
-    name: Hash lock / ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-24.04
-            architecture: x64
-          - name: macOS ARM64
-            runner: macos-15
-            architecture: arm64
-          - name: Windows x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.11"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Verify hash-locked dependencies
-        # Both locks, separately: each must be internally complete on its own,
-        # because the Docker build installs them as two independent
-        # --require-hashes passes. A native matrix is required because package
-        # markers are evaluated for the host running pip.
-        run: |
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-lock.txt
-          python -m pip install --dry-run --ignore-installed --require-hashes -r requirements-channels-lock.txt
-
-  test:
-    name: test / Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
-    # 10 minutes stopped fitting again after the frontend split below: on
-    # 2026-09-29 the 3.11 leg's pytest step took 520s of a job that finished
-    # at exactly 600s (run 36553260060), and the next push was cancelled at
-    # 99% of the suite with no failing test (36556726032). The suite, not a
-    # hang, fills the budget, and runner speed varies by minutes (the same
-    # tree's 3.14 leg took 5m14s one run and 8m32s the other), so the limit
-    # leaves room for that instead of being trimmed to the last good run.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        # The floor and the ceiling of `requires-python` in pyproject.toml.
-        # The ceiling leg exists because the <3.14 cap came off in 0bb1d870:
-        # supporting a version nothing exercises is how the cap got stale in
-        # the first place. Raise the upper leg whenever the floor or a new
-        # CPython release moves.
-        python-version: ["3.11", "3.14"]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        # `openbb` is included so agent/tests/test_openbb_bridge actually runs:
-        # those tests importorskip on openbb_ai, so without the extra the whole
-        # OpenBB Workspace bridge would report green while never being exercised.
-        # `stats` is included for the same reason: the quantlib econometrics
-        # tests skip without statsmodels/arch, and skipped is not tested.
-        run: pip install -e ".[dev,openbb,stats,anthropic]"
-
-      - name: Verify optional extras under test are importable
-        # Fails loudly if an extra stops resolving, instead of letting its
-        # suite silently degrade to skips.
-        run: |
-          python -c "import openbb_ai, importlib.metadata as m; print('openbb-ai', m.version('openbb-ai'))"
-          python -c "import statsmodels; print('statsmodels', statsmodels.__version__)"
-          python -c "import arch; print('arch', arch.__version__)"
-          python -c "import langchain_anthropic; print('langchain-anthropic', langchain_anthropic.__version__)"
-
-      - name: Repository safety gates
-        run: bash tools/ci_grep_gates.sh
-
-      - name: Test environment variable gate
-        run: pytest tools/test_ci_env_var_gate.py -q
-
-      - name: Syntax check
-        run: |
-          cd agent
-          python -m compileall -q cli
-          python -m py_compile api_server.py
-          python -m py_compile mcp_server.py
-          python -m py_compile src/agent/loop.py
-          python -m py_compile src/tools/__init__.py
-          python -m py_compile backtest/runner.py
-
-      - name: Run tests
-        # test_e2e_harness_v2.py is gated by VIBE_TRADING_RUN_LIVE_E2E
-        # (real-LLM only); list --ignore here so CI's intent is explicit and
-        # the suite never silently switches state on env presence.
-        run: pytest --ignore=agent/tests/e2e_backtest --ignore=agent/tests/test_e2e_harness_v2.py --cov=agent --cov-report=term-missing --cov-report=xml --tb=short -q
-
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Split out of `test` on 2026-09-04. It used to be the tail of BOTH Python
-    # matrix legs, which ran the identical npm ci + tsc + vite + vitest twice
-    # per push for a tree that has no Python in it. That duplication was free
-    # until the Python 3.11 leg grew to 539s of its 600s budget: on 8555a05a an
-    # npm registry slowdown pushed `npm ci` from its usual ~20s to over 130s and
-    # the leg hit `timeout-minutes` mid-install, reporting as `cancelled` with a
-    # green backend. Nothing here is tested less than before — the same three
-    # commands run on the same tree — but the frontend now owns its own budget
-    # and the Python legs get ~65s of headroom back.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Frontend build
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      - name: Frontend tests
-        run: |
-          cd frontend
-          npx vitest run --reporter=verbose
-
-  windows-background:
-    name: ${{ matrix.name }} / Python 3.14 background lifecycle
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows 11 ARM64
-            runner: windows-11-arm
-            architecture: arm64
-          - name: Windows Server 2025 x64
-            runner: windows-2025
-            architecture: x64
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.14"
-          architecture: ${{ matrix.architecture }}
-          cache: pip
-
-      - name: Install focused test dependencies
-        run: python -m pip install pytest pydantic pyyaml python-dotenv
-
-      - name: Run Windows background safety regressions
-        env:
-          PYTHONPATH: agent
-        run: >-
-          python -m pytest
-          agent/tests/test_background_tools.py
-          agent/tests/test_bash_tool.py
-          -q
-
-  desktop-electron-windows:
-    name: Windows desktop source lifecycle
-    runs-on: windows-2025
-    timeout-minutes: 30
-
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      # actions/setup-python v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-
-      # actions/setup-node v7.0.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/electron/package-lock.json
-
-      - name: Install Vibe-Trading source backend
-        run: python -m pip install -e .
-
-      - name: Install desktop dependencies
-        working-directory: desktop/electron
-        run: npm ci
-
-      - name: Prepare verified Electron runtime
-        working-directory: desktop/electron
-        run: npm run prepare:electron
-
-      - name: Build desktop shell
-        working-directory: desktop/electron
-        run: npm run build
-
-      - name: Run desktop lifecycle and parent-death smoke tests
-        working-directory: desktop/electron
-        run: npm run smoke:lifecycle
+{
+  "name": "test",
+  "on": {
+    "push": {
+      "branches": [
+        "validation/openbot-provider-error-diagnostic-20261030"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "diagnostic": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 20,
+      "steps": [
+        {
+          "name": "Use pinned Node",
+          "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+          "with": {
+            "node-version": "22.19.0"
+          }
+        },
+        {
+          "name": "Install verified official Bun1.4.3",
+          "shell": "bash",
+          "run": "set -euo pipefail\npython3 - <<'PYINSTALL'\nimport urllib.request,json,hashlib,base64,tarfile,io,pathlib,os\np=pathlib.Path(os.environ['RUNNER_TEMP'])/'bun143';p.mkdir()\nm=json.load(urllib.request.urlopen('https://registry.npmjs.org/@oven%2fbun-linux-x64/1.4.3',timeout=30))\nassert m['name']=='@oven/bun-linux-x64' and m['version']=='1.4.3'\nu=m['dist']['tarball'];assert u.startswith('https://registry.npmjs.org/')\nb=urllib.request.urlopen(u,timeout=90).read();assert 'sha512-'+base64.b64encode(hashlib.sha512(b).digest()).decode()==m['dist']['integrity']\nwith tarfile.open(fileobj=io.BytesIO(b),mode='r:gz') as t:\n matches=[x for x in t.getmembers() if x.isfile() and x.name.endswith('/bin/bun')];assert len(matches)==1\n (p/'bun').write_bytes(t.extractfile(matches[0]).read());(p/'bun').chmod(0o755)\nos.symlink('bun',p/'bunx')\nwith open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(p)+'\\n')\nPYINSTALL\n"
+        },
+        {
+          "name": "Materialize immutable base and diagnostic only",
+          "id": "prepare",
+          "shell": "bash",
+          "run": "set -euo pipefail\nmkdir -p \"$RUNNER_TEMP/openbot-883\" \"$RUNNER_TEMP/openbot-883-receipts\"\ncd \"$RUNNER_TEMP/openbot-883\"\ngit init -q\ngit remote add origin https://github.com/CopilotKit/OpenBot.git\ngit fetch --depth=1 origin ab9855c19848378c90a806426130d86699cc798c\ngit checkout --detach FETCH_HEAD\ntest \"$(git rev-parse HEAD)\" = ab9855c19848378c90a806426130d86699cc798c\ntest \"$(git hash-object server/tests/fixtures/openai-wire/responses-stream.sse)\" = 005646a84b35790868377957bdbe2f617b2e78d4\ntest \"$(bun --version)\" = 1.4.3\nbun install --frozen-lockfile\npython3 - <<'PYFILES'\nimport pathlib,base64,hashlib,os\nb=base64.b64decode('aW1wb3J0IHsgZXhwZWN0LCB0ZXN0IH0gZnJvbSAiYnVuOnRlc3QiOwppbXBvcnQgeyByZWFkRmlsZVN5bmMgfSBmcm9tICJub2RlOmZzIjsKaW1wb3J0IHsgbGFzdFZhbHVlRnJvbSwgdG9BcnJheSB9IGZyb20gInJ4anMiOwppbXBvcnQgeyB6IH0gZnJvbSAiem9kIjsKaW1wb3J0IHsgYnVpbGRBZ2VudHMsIGNob29zZU9wZW5BSUFwaSB9IGZyb20gIi4uL3NyYy9jb3BpbG90IjsKCmNvbnN0IE1PREVMID0geyBwcm92aWRlcjogIm9wZW5haSIgYXMgY29uc3QsIGRlZmF1bHRNb2RlbDogImdwdC01LjYtdGVycmEiIH07CmNvbnN0IE1FU1NBR0UgPSAiSW52YWxpZCAndG9vbHMnOiBhcnJheSB0b28gbG9uZy4gRXhwZWN0ZWQgYW4gYXJyYXkgd2l0aCBtYXhpbXVtIGxlbmd0aCAxMjgsIGJ1dCBnb3QgYW4gYXJyYXkgd2l0aCBsZW5ndGggMTI5IGluc3RlYWQuIjsKY29uc3QgcmVzcG9uc2VGaXh0dXJlID0gcmVhZEZpbGVTeW5jKG5ldyBVUkwoIi4vZml4dHVyZXMvb3BlbmFpLXdpcmUvcmVzcG9uc2VzLXN0cmVhbS5zc2UiLCBpbXBvcnQubWV0YS51cmwpLCAidXRmOCIpOwpjb25zdCBjcmVhdGVkTGluZSA9IHJlc3BvbnNlRml4dHVyZS5zcGxpdCgiXG4iKS5maW5kKChsaW5lKSA9PiBsaW5lLnN0YXJ0c1dpdGgoImRhdGE6ICIpKSE7CmNvbnN0IG9yaWdpbmFsUmVzcG9uc2UgPSBKU09OLnBhcnNlKGNyZWF0ZWRMaW5lLnNsaWNlKDYpKS5yZXNwb25zZTsKCmFzeW5jIGZ1bmN0aW9uIHByb2JlKG1vZGU6ICJodHRwNDAwIiB8ICJmYWlsZWQtZXZlbnQiIHwgInN1Y2Nlc3MiLCB0b29sQ291bnQ6IG51bWJlcikgewogIGNvbnN0IHByaW9yQmFzZSA9IHByb2Nlc3MuZW52Lk9QRU5BSV9CQVNFX1VSTDsKICBjb25zdCBwcmlvckFwaSA9IHByb2Nlc3MuZW52LkNPUElMT1RLSVRfT1BFTkFJX0FQSTsKICBjb25zdCByZXF1ZXN0czogeyBwYXRoOiBzdHJpbmc7IGNvdW50OiBudW1iZXIgfVtdID0gW107CiAgY29uc3QgZW5kcG9pbnQgPSBCdW4uc2VydmUoeyBwb3J0OiAwLCBhc3luYyBmZXRjaChyZXF1ZXN0KSB7CiAgICBjb25zdCBib2R5ID0gYXdhaXQgcmVxdWVzdC5qc29uKCkgYXMgeyB0b29scz86IHVua25vd25bXSB9OwogICAgcmVxdWVzdHMucHVzaCh7IHBhdGg6IG5ldyBVUkwocmVxdWVzdC51cmwpLnBhdGhuYW1lLCBjb3VudDogYm9keS50b29scz8ubGVuZ3RoID8/IDAgfSk7CiAgICBpZiAobW9kZSA9PT0gImh0dHA0MDAiKSByZXR1cm4gUmVzcG9uc2UuanNvbih7IGVycm9yOiB7IG1lc3NhZ2U6IE1FU1NBR0UsIHR5cGU6ICJpbnZhbGlkX3JlcXVlc3RfZXJyb3IiLCBwYXJhbTogInRvb2xzIiwgY29kZTogImFycmF5X2Fib3ZlX21heF9sZW5ndGgiIH0gfSwgeyBzdGF0dXM6IDQwMCB9KTsKICAgIGNvbnN0IGZhaWxlZCA9IHsgLi4ub3JpZ2luYWxSZXNwb25zZSwgc3RhdHVzOiAiZmFpbGVkIiwgZXJyb3I6IHsgY29kZTogImludmFsaWRfcHJvbXB0IiwgbWVzc2FnZTogTUVTU0FHRSB9IH07CiAgICBjb25zdCBzdHJlYW0gPSBtb2RlID09PSAic3VjY2VzcyIgPyByZXNwb25zZUZpeHR1cmUgOgogICAgICBgZXZlbnQ6IHJlc3BvbnNlLmNyZWF0ZWRcbmRhdGE6ICR7SlNPTi5zdHJpbmdpZnkoeyB0eXBlOiAicmVzcG9uc2UuY3JlYXRlZCIsIHJlc3BvbnNlOiBvcmlnaW5hbFJlc3BvbnNlLCBzZXF1ZW5jZV9udW1iZXI6IDAgfSl9XG5cbmAgKwogICAgICBgZXZlbnQ6IHJlc3BvbnNlLmZhaWxlZFxuZGF0YTogJHtKU09OLnN0cmluZ2lmeSh7IHR5cGU6ICJyZXNwb25zZS5mYWlsZWQiLCByZXNwb25zZTogZmFpbGVkLCBzZXF1ZW5jZV9udW1iZXI6IDEgfSl9XG5cbmA7CiAgICByZXR1cm4gbmV3IFJlc3BvbnNlKHN0cmVhbSwgeyBoZWFkZXJzOiB7ICJjb250ZW50LXR5cGUiOiAidGV4dC9ldmVudC1zdHJlYW0iIH0gfSk7CiAgfSB9KTsKICB0cnkgewogICAgcHJvY2Vzcy5lbnYuT1BFTkFJX0JBU0VfVVJMID0gYGh0dHA6Ly8xMjcuMC4wLjE6JHtlbmRwb2ludC5wb3J0fS92MWA7CiAgICBwcm9jZXNzLmVudi5DT1BJTE9US0lUX09QRU5BSV9BUEkgPSAicmVzcG9uc2VzIjsKICAgIGNob29zZU9wZW5BSUFwaShNT0RFTCk7CiAgICBjb25zdCB0b29scyA9IEFycmF5LmZyb20oeyBsZW5ndGg6IHRvb2xDb3VudCB9LCAoXywgaW5kZXgpID0+ICh7IG5hbWU6IGBmaXh0dXJlX3Rvb2xfJHtpbmRleH1gLCByZWY6IGBmaXh0dXJlL3Rvb2xfJHtpbmRleH1gLCBkZXNjcmlwdGlvbjogIkZpeHR1cmUgdG9vbCIsIHBhcmFtZXRlcnM6IHoub2JqZWN0KHt9KSwgZXhlY3V0ZTogYXN5bmMgKCkgPT4gImZpeHR1cmUiIH0pKTsKICAgIGNvbnN0IGFnZW50cyA9IGF3YWl0IGJ1aWxkQWdlbnRzKFt7IGlkOiAiZml4dHVyZSIsIG5hbWU6ICJGaXh0dXJlIiwgdHlwZTogImJ1aWx0X2luIiwgc3lzdGVtUHJvbXB0OiAiQW5zd2VyIGJyaWVmbHkuIiB9XSwgTU9ERUwsICJzeW50aGV0aWMtbm8tdmVuZG9yLWtleSIsIHVuZGVmaW5lZCwgYXN5bmMgKCkgPT4gdG9vbHMpOwogICAgY29uc3QgYWdlbnQgPSBhZ2VudHMuZml4dHVyZT8uY2xvbmUoKTsKICAgIGlmICghYWdlbnQpIHRocm93IG5ldyBFcnJvcigiRml4dHVyZSBhZ2VudCB3YXMgbm90IGJ1aWx0Iik7CiAgICBsZXQgc3RyZWFtRXJyb3I6IHN0cmluZyB8IG51bGwgPSBudWxsOwogICAgY29uc3QgZXZlbnRzID0gYXdhaXQgbGFzdFZhbHVlRnJvbShhZ2VudC5ydW4oeyB0aHJlYWRJZDogImZpeHR1cmUtdGhyZWFkIiwgcnVuSWQ6ICJmaXh0dXJlLXJ1biIsIG1lc3NhZ2VzOiBbeyBpZDogInF1ZXN0aW9uIiwgcm9sZTogInVzZXIiLCBjb250ZW50OiAiU2F5IGhlbGxvLiIgfV0sIHRvb2xzOiBbXSwgY29udGV4dDogW10sIHN0YXRlOiB7fSwgZm9yd2FyZGVkUHJvcHM6IHt9IH0pLnBpcGUodG9BcnJheSgpKSkuY2F0Y2goKGVycm9yOiB1bmtub3duKSA9PiB7IHN0cmVhbUVycm9yID0gZXJyb3IgaW5zdGFuY2VvZiBFcnJvciA/IGVycm9yLm1lc3NhZ2UgOiBTdHJpbmcoZXJyb3IpOyByZXR1cm4gW107IH0pOwogICAgZXhwZWN0KHJlcXVlc3RzLmxlbmd0aCkudG9CZUdyZWF0ZXJUaGFuKDApOwogICAgZXhwZWN0KHJlcXVlc3RzLmV2ZXJ5KChyZXF1ZXN0KSA9PiByZXF1ZXN0LnBhdGggPT09ICIvdjEvcmVzcG9uc2VzIikpLnRvQmUodHJ1ZSk7CiAgICBleHBlY3QocmVxdWVzdHNbMF0/LmNvdW50KS50b0JlR3JlYXRlclRoYW5PckVxdWFsKHRvb2xDb3VudCk7CiAgICBjb25zdCByZXN1bHQgPSB7IG1vZGUsIHRvb2xDb3VudCwgcmVxdWVzdHMsIHN0cmVhbUVycm9yLCBldmVudHMgfTsKICAgIGNvbnNvbGUubG9nKCJPUEVOQk9UXzg4M19QUk9CRSAiICsgSlNPTi5zdHJpbmdpZnkocmVzdWx0KSk7CiAgICBpZiAobW9kZSA9PT0gInN1Y2Nlc3MiKSBleHBlY3QoZXZlbnRzLnNvbWUoKGV2ZW50KSA9PiBldmVudC50eXBlID09PSAiVEVYVF9NRVNTQUdFX0NPTlRFTlQiKSkudG9CZSh0cnVlKTsKICAgIGVsc2UgZXhwZWN0KHN0cmVhbUVycm9yPy5pbmNsdWRlcygiYXJyYXkgdG9vIGxvbmciKSB8fCBldmVudHMuc29tZSgoZXZlbnQpID0+IGV2ZW50LnR5cGUgPT09ICJSVU5fRVJST1IiICYmIEpTT04uc3RyaW5naWZ5KGV2ZW50KS5pbmNsdWRlcygiYXJyYXkgdG9vIGxvbmciKSkpLnRvQmUodHJ1ZSk7CiAgfSBmaW5hbGx5IHsKICAgIGlmIChwcmlvckJhc2UgPT09IHVuZGVmaW5lZCkgZGVsZXRlIHByb2Nlc3MuZW52Lk9QRU5BSV9CQVNFX1VSTDsgZWxzZSBwcm9jZXNzLmVudi5PUEVOQUlfQkFTRV9VUkwgPSBwcmlvckJhc2U7CiAgICBpZiAocHJpb3JBcGkgPT09IHVuZGVmaW5lZCkgZGVsZXRlIHByb2Nlc3MuZW52LkNPUElMT1RLSVRfT1BFTkFJX0FQSTsgZWxzZSBwcm9jZXNzLmVudi5DT1BJTE9US0lUX09QRU5BSV9BUEkgPSBwcmlvckFwaTsKICAgIGVuZHBvaW50LnN0b3AodHJ1ZSk7CiAgfQp9Cgp0ZXN0KCI4ODM6IEhUVFAgcHJvdmlkZXIgcmVmdXNhbCByZWFjaGVzIHRoZSByZWFsIGFnZW50IGNhbGxlciIsICgpID0+IHByb2JlKCJodHRwNDAwIiwgMTI5KSk7CnRlc3QoIjg4MzogZmFpbGVkIFJlc3BvbnNlcyBldmVudCByZWFjaGVzIHRoZSByZWFsIGFnZW50IGNhbGxlciIsICgpID0+IHByb2JlKCJmYWlsZWQtZXZlbnQiLCAxMjkpKTsKdGVzdCgiODgzIGNvbnRyb2w6IHN1Y2Nlc3NmdWwgcHJvdmlkZXIgYW5zd2VyIHJlYWNoZXMgdGhlIHJlYWwgYWdlbnQgY2FsbGVyIiwgKCkgPT4gcHJvYmUoInN1Y2Nlc3MiLCAxKSk7Cg==')\nassert hashlib.sha256(b).hexdigest()=='e5e2878bc9354722497c4654247252ba7e168e680a343d542994686a57107755'\npathlib.Path('server/tests/provider-error-probe.test.ts').write_bytes(b)\npathlib.Path(os.environ['RUNNER_TEMP'],'openbot-883-receipts','diagnostic-oracle.py').write_bytes(base64.b64decode('aW1wb3J0IGpzb24scGF0aGxpYixzeXMseG1sLmV0cmVlLkVsZW1lbnRUcmVlIGFzIEVUClBSRUZJWD0nT1BFTkJPVF84ODNfUFJPQkUgJwpOQU1FUz17J2h0dHA0MDAnOic4ODM6IEhUVFAgcHJvdmlkZXIgcmVmdXNhbCByZWFjaGVzIHRoZSByZWFsIGFnZW50IGNhbGxlcicsJ2ZhaWxlZC1ldmVudCc6Jzg4MzogZmFpbGVkIFJlc3BvbnNlcyBldmVudCByZWFjaGVzIHRoZSByZWFsIGFnZW50IGNhbGxlcicsJ3N1Y2Nlc3MnOic4ODMgY29udHJvbDogc3VjY2Vzc2Z1bCBwcm92aWRlciBhbnN3ZXIgcmVhY2hlcyB0aGUgcmVhbCBhZ2VudCBjYWxsZXInfQpkZWYgdmFsaWRhdGUobG9nLHhtbCk6CiByb3dzPVtqc29uLmxvYWRzKGxpbmUuc3BsaXQoUFJFRklYLDEpWzFdKSBmb3IgbGluZSBpbiBsb2cuc3BsaXRsaW5lcygpIGlmIFBSRUZJWCBpbiBsaW5lXQogYXNzZXJ0IGxlbihyb3dzKT09MywnRXhhY3RseSB0aHJlZSBhY3R1YWwgZGlhZ25vc3RpYyByZWNlaXB0cyByZXF1aXJlZCcKIG1vZGVzPXtyWydtb2RlJ106ciBmb3IgciBpbiByb3dzfTthc3NlcnQgc2V0KG1vZGVzKT09c2V0KE5BTUVTKSwnTWlzc2luZyBvciBkdXBsaWNhdGUgbW9kZScKIHJvb3Q9RVQuZnJvbXN0cmluZyh4bWwpO2Nhc2VzPWxpc3Qocm9vdC5pdGVyKCd0ZXN0Y2FzZScpKTthc3NlcnQgbGVuKGNhc2VzKT09MywnVW5leHBlY3RlZC9taXNzaW5nIG5hdGl2ZSB0ZXN0IGNhc2VzJwogYXNzZXJ0IG5vdCBsaXN0KHJvb3QuaXRlcignZXJyb3InKSkgYW5kIG5vdCBsaXN0KHJvb3QuaXRlcignc2tpcHBlZCcpKSwnU2V0dXAvZXJyb3Ivc2tpcHBlZCB0ZXN0IGlzIG5vdCBuYXRpdmUgZGlhZ25vc3RpYycKIG91dGNvbWVzPXt9CiBmb3IgbW9kZSxyb3cgaW4gbW9kZXMuaXRlbXMoKToKICByZXFzPXJvd1sncmVxdWVzdHMnXTthc3NlcnQgcmVxcyBhbmQgYWxsKHJbJ3BhdGgnXT09Jy92MS9yZXNwb25zZXMnIGZvciByIGluIHJlcXMpLCdBY3R1YWwgUmVzcG9uc2VzIHdpcmUgcGF0aCBtaXNzaW5nJwogIGFzc2VydCBhbGwoclsnY291bnQnXT49ICgxIGlmIG1vZGU9PSdzdWNjZXNzJyBlbHNlIDEyOSkgZm9yIHIgaW4gcmVxcyksJ1dyb25nIHdpcmUgdG9vbCBjb3VudCcKICBhc3NlcnQgcm93Wyd0b29sQ291bnQnXT09KDEgaWYgbW9kZT09J3N1Y2Nlc3MnIGVsc2UgMTI5KSwnV3JvbmcgaW5wdXQgdG9vbCBjb3VudCcKICBldmVudHM9cm93WydldmVudHMnXTthc3NlcnQgaXNpbnN0YW5jZShldmVudHMsbGlzdCksJ01pc3NpbmcgY2FwdHVyZWQgU0RLIGV2ZW50cycKICBmb3VuZD1bYyBmb3IgYyBpbiBjYXNlcyBpZiBjLmdldCgnbmFtZScpPT1OQU1FU1ttb2RlXSBvciBjLmdldCgnbmFtZScsJycpLmVuZHN3aXRoKE5BTUVTW21vZGVdKV07YXNzZXJ0IGxlbihmb3VuZCk9PTEsJ05hdGl2ZSBuYW1lZCB0ZXN0IG1pc3NpbmcnCiAgZmFpbGVkPWZvdW5kWzBdLmZpbmQoJ2ZhaWx1cmUnKSBpcyBub3QgTm9uZQogIGlmIG1vZGU9PSdzdWNjZXNzJzoKICAgYXNzZXJ0IG5vdCBmYWlsZWQgYW5kIHJvd1snc3RyZWFtRXJyb3InXSBpcyBOb25lIGFuZCBhbnkoZS5nZXQoJ3R5cGUnKT09J1RFWFRfTUVTU0FHRV9DT05URU5UJyBhbmQgZS5nZXQoJ2RlbHRhJykgZm9yIGUgaW4gZXZlbnRzKSwnUG9zaXRpdmUgYWN0dWFsLXN0cmVhbSBjb250cm9sIGZhaWxlZCcKICAgb3V0Y29tZXNbbW9kZV09J1ZJU0lCTEVfU1VDQ0VTU19DT05UUk9MJwogIGVsc2U6CiAgIHZpc2libGU9KCdhcnJheSB0b28gbG9uZycgaW4gKHJvd1snc3RyZWFtRXJyb3InXSBvciAnJykpIG9yIGFueShlLmdldCgndHlwZScpPT0nUlVOX0VSUk9SJyBhbmQgJ2FycmF5IHRvbyBsb25nJyBpbiBqc29uLmR1bXBzKGUpIGZvciBlIGluIGV2ZW50cykKICAgYXNzZXJ0IGZhaWxlZCAhPSB2aXNpYmxlLCdKVW5pdCBhbmQgcnVudGltZSBldmlkZW5jZSBkaXNhZ3JlZScKICAgaWYgdmlzaWJsZTpvdXRjb21lc1ttb2RlXT0nUFJPVklERVJfUkVGVVNBTF9QUk9QQUdBVEVTX0FMUkVBRFknCiAgIGVsaWYgcm93WydzdHJlYW1FcnJvciddIGlzIE5vbmUgYW5kIGFueShlLmdldCgndHlwZScpPT0nUlVOX0ZJTklTSEVEJyBmb3IgZSBpbiBldmVudHMpIGFuZCBub3QgYW55KGUuZ2V0KCd0eXBlJykgaW4gWydSVU5fRVJST1InLCdURVhUX01FU1NBR0VfQ09OVEVOVCcsJ1RPT0xfQ0FMTF9TVEFSVCddIGZvciBlIGluIGV2ZW50cyk6b3V0Y29tZXNbbW9kZV09J1NJTEVOVF9URVJNSU5BTF9DQU5ESURBVEVfUkVRVUlSRVNfRklYX1JFVklFVycKICAgZWxzZTpvdXRjb21lc1ttb2RlXT0nSU5DT05DTFVTSVZFX09USEVSX1JVTlRJTUVfQkVIQVZJT1InCiByZXR1cm4geydzdGF0dXMnOidWQUxJRF9OQVRJVkVfRElBR05PU1RJQ19OT1RfUVVBTElGSUNBVElPTicsJ291dGNvbWVzJzpvdXRjb21lcywncHJvZHVjdGlvbl9jaGFuZ2VzJzpGYWxzZSwnbGl2ZV92ZW5kb3JfYWNjZXB0YW5jZSc6RmFsc2V9CmlmIF9fbmFtZV9fPT0nX19tYWluX18nOgogcmVzdWx0PXZhbGlkYXRlKHBhdGhsaWIuUGF0aChzeXMuYXJndlsxXSkucmVhZF90ZXh0KCkscGF0aGxpYi5QYXRoKHN5cy5hcmd2WzJdKS5yZWFkX3RleHQoKSk7cGF0aGxpYi5QYXRoKHN5cy5hcmd2WzNdKS53cml0ZV90ZXh0KGpzb24uZHVtcHMocmVzdWx0LGluZGVudD0yKSsnXG4nKTtwcmludChqc29uLmR1bXBzKHJlc3VsdCkpCg=='))\nPYFILES\n"
+        },
+        {
+          "name": "Capture three actual SDK modes and evaluate diagnostic",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/openbot-883\"\nbun run generate:app-config\nset +e\nbun test server/tests/provider-error-probe.test.ts --reporter=junit --reporter-outfile=\"$RUNNER_TEMP/openbot-883-receipts/diagnostic.xml\" > \"$RUNNER_TEMP/openbot-883-receipts/diagnostic.log\" 2>&1\nresult=$?\nset -e\nprintf '%s\\n' \"$result\" > \"$RUNNER_TEMP/openbot-883-receipts/native-exit.txt\"\ncat \"$RUNNER_TEMP/openbot-883-receipts/diagnostic.log\"\npython3 \"$RUNNER_TEMP/openbot-883-receipts/diagnostic-oracle.py\" \"$RUNNER_TEMP/openbot-883-receipts/diagnostic.log\" \"$RUNNER_TEMP/openbot-883-receipts/diagnostic.xml\" \"$RUNNER_TEMP/openbot-883-receipts/verdict.json\"\n"
+        },
+        {
+          "name": "Verify untouched production source and fixture",
+          "if": "${{ always() && steps.prepare.outcome == 'success' }}",
+          "shell": "bash",
+          "run": "set -euo pipefail\ncd \"$RUNNER_TEMP/openbot-883\"\ngit diff --exit-code HEAD --\ntest \"$(git hash-object server/tests/fixtures/openai-wire/responses-stream.sse)\" = 005646a84b35790868377957bdbe2f617b2e78d4\ntest \"$(git ls-files --others --exclude-standard)\" = server/tests/provider-error-probe.test.ts\ngit rev-parse HEAD > \"$RUNNER_TEMP/openbot-883-receipts/base.txt\"\ngit status --short > \"$RUNNER_TEMP/openbot-883-receipts/source-status.txt\"\n"
+        },
+        {
+          "name": "Upload diagnostic evidence",
+          "if": "always()",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "openbot-883-native-diagnostic",
+            "path": "${{ runner.temp }}/openbot-883-receipts",
+            "if-no-files-found": "warn"
+          }
+        }
+      ],
+      "if": "${{ github.repository == 'rudycelekli/Vibe-Trading' && github.ref == 'refs/heads/validation/openbot-provider-error-diagnostic-20261030' }}"
+    }
+  }
+}
