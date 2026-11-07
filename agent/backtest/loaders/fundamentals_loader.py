@@ -91,7 +91,10 @@ def _extract_concept_series(
                         "period_end": item.get("end"),
                         "filed": item.get("filed"),
                         "value": item.get("val"),
-                        "_concept_order": concept_order,
+                        # Same-filing aliases are deduplicated with keep="first"
+                        # (pit) or keep="last" (research); flip the order for the
+                        # latter so the highest-priority alias still wins.
+                        "_concept_order": concept_order if pit else -concept_order,
                     }
                 )
 
